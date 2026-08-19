@@ -1,0 +1,1122 @@
+package store
+
+import (
+	"context"
+	"crypto/sha256"
+	"database/sql"
+	"errors"
+	"fmt"
+	"net/url"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/flemzord/skillloop/internal/domain"
+	_ "modernc.org/sqlite"
+)
+
+var ErrNotFound = errors.New("store: not found")
+
+type Counts struct {
+	Sessions         int
+	Skills           int
+	Cards            int
+	Clusters         int
+	EligibleClusters int
+	ActivePromotions int
+	Rollbacks        int
+	Jobs             map[domain.JobStatus]int
+	Proposals        map[domain.ProposalStatus]int
+}
+
+// Store persists SkillLoop's durable metadata. Transcript contents deliberately
+// remain outside the database; sessions only retain their original locator.
+type Store struct {
+	db  *sql.DB
+	now func() time.Time
+}
+
+func Open(ctx context.Context, path string) (*Store, error) {
+	if strings.TrimSpace(path) == "" {
+		return nil, errors.New("store: database path is required")
+	}
+
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return nil, fmt.Errorf("store: resolve database path: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(absPath), 0o700); err != nil {
+		return nil, fmt.Errorf("store: create database directory: %w", err)
+	}
+
+	query := url.Values{}
+	query.Add("_pragma", "busy_timeout(5000)")
+	query.Add("_pragma", "foreign_keys(1)")
+	query.Add("_pragma", "journal_mode(WAL)")
+	dsn := (&url.URL{Scheme: "file", Path: absPath, RawQuery: query.Encode()}).String()
+
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("store: open database: %w", err)
+	}
+	// SkillLoop has one local daemon. Serializing access avoids SQLITE_BUSY while
+	// WAL still provides crash-safe, restartable persistence.
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+
+	store := &Store{db: db, now: time.Now}
+	if err := db.PingContext(ctx); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("store: ping database: %w", err)
+	}
+	if err := os.Chmod(absPath, 0o600); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("store: secure database file: %w", err)
+	}
+	if err := store.migrate(ctx); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return store, nil
+}
+
+func (s *Store) Close() error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	return s.db.Close()
+}
+
+func (s *Store) RegisterSkill(ctx context.Context, skill domain.Skill) (bool, error) {
+	if skill.ID == "" || skill.Name == "" || skill.RepositoryPath == "" || skill.InstructionPath == "" {
+		return false, errors.New("store: skill id, name, repository path, and instruction path are required")
+	}
+	createdAt := timeOrNow(skill.CreatedAt, s.now)
+	result, err := s.db.ExecContext(ctx, `
+		INSERT INTO skills (id, name, repository_path, instruction_path, enabled, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO NOTHING`,
+		skill.ID, skill.Name, skill.RepositoryPath, skill.InstructionPath, boolInt(skill.Enabled), unixNano(createdAt),
+	)
+	if err != nil {
+		return false, fmt.Errorf("store: register skill: %w", err)
+	}
+	return rowsChanged(result)
+}
+
+func (s *Store) ListSkills(ctx context.Context) ([]domain.Skill, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, name, repository_path, instruction_path, enabled, created_at
+		FROM skills ORDER BY name, id`)
+	if err != nil {
+		return nil, fmt.Errorf("store: list skills: %w", err)
+	}
+	defer rows.Close()
+
+	var skills []domain.Skill
+	for rows.Next() {
+		var skill domain.Skill
+		var enabled int
+		var createdAt int64
+		if err := rows.Scan(&skill.ID, &skill.Name, &skill.RepositoryPath, &skill.InstructionPath, &enabled, &createdAt); err != nil {
+			return nil, fmt.Errorf("store: scan skill: %w", err)
+		}
+		skill.Enabled = enabled != 0
+		skill.CreatedAt = fromUnixNano(createdAt)
+		skills = append(skills, skill)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate skills: %w", err)
+	}
+	return skills, nil
+}
+
+func (s *Store) RecordSession(ctx context.Context, session domain.Session) (bool, error) {
+	if session.Reference == "" || !session.Source.Valid() || session.ExternalID == "" {
+		return false, errors.New("store: session reference, valid source, and external id are required")
+	}
+	now := s.now()
+	result, err := s.db.ExecContext(ctx, `
+		INSERT INTO sessions (
+			reference, source, external_id, turn_id, working_dir, transcript_path, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(source, external_id) DO NOTHING`,
+		session.Reference, session.Source, session.ExternalID, session.TurnID, session.WorkingDir,
+		session.TranscriptPath, unixNano(now), unixNano(now),
+	)
+	if err != nil {
+		return false, fmt.Errorf("store: record session: %w", err)
+	}
+	created, err := rowsChanged(result)
+	if err != nil {
+		return false, err
+	}
+	if created {
+		return true, nil
+	}
+	var storedReference string
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT reference FROM sessions WHERE source = ? AND external_id = ?`,
+		session.Source, session.ExternalID,
+	).Scan(&storedReference); err != nil {
+		return false, fmt.Errorf("store: resolve existing session: %w", err)
+	}
+	if storedReference != session.Reference {
+		return false, fmt.Errorf(
+			"store: session %s/%s already uses reference %q",
+			session.Source, session.ExternalID, storedReference,
+		)
+	}
+
+	result, err = s.db.ExecContext(ctx, `
+		UPDATE sessions SET
+			turn_id = CASE WHEN ? <> '' THEN ? ELSE turn_id END,
+			working_dir = CASE WHEN ? <> '' THEN ? ELSE working_dir END,
+			transcript_path = CASE WHEN ? <> '' THEN ? ELSE transcript_path END,
+			updated_at = ?
+		WHERE source = ? AND external_id = ?`,
+		session.TurnID, session.TurnID,
+		session.WorkingDir, session.WorkingDir,
+		session.TranscriptPath, session.TranscriptPath,
+		unixNano(now), session.Source, session.ExternalID,
+	)
+	if err != nil {
+		return false, fmt.Errorf("store: refresh session: %w", err)
+	}
+	changed, err := rowsChanged(result)
+	if err != nil {
+		return false, err
+	}
+	if !changed {
+		return false, errors.New("store: session conflict could not be refreshed")
+	}
+	return false, nil
+}
+
+func (s *Store) AddLearningCard(ctx context.Context, card domain.LearningCard) (bool, error) {
+	if card.ID == "" || card.SessionRef == "" || card.SkillID == "" || card.Fingerprint == "" {
+		return false, errors.New("store: card id, session, skill, and fingerprint are required")
+	}
+	if !validCardKind(card.Kind) {
+		return false, fmt.Errorf("store: invalid card kind %q", card.Kind)
+	}
+	if card.Confidence < 0 || card.Confidence > 1 {
+		return false, errors.New("store: card confidence must be between 0 and 1")
+	}
+	result, err := s.db.ExecContext(ctx, `
+		INSERT INTO learning_cards (
+			id, session_ref, skill_id, kind, fingerprint, summary, lesson, confidence, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(session_ref, skill_id, fingerprint) DO NOTHING`,
+		card.ID, card.SessionRef, card.SkillID, card.Kind, card.Fingerprint,
+		card.Summary, card.Lesson, card.Confidence, unixNano(timeOrNow(card.CreatedAt, s.now)),
+	)
+	if err != nil {
+		return false, fmt.Errorf("store: add learning card: %w", err)
+	}
+	return rowsChanged(result)
+}
+
+func (s *Store) ListLearningCards(ctx context.Context, skillID string) ([]domain.LearningCard, error) {
+	query := `
+		SELECT id, session_ref, skill_id, kind, fingerprint, summary, lesson, confidence, created_at
+		FROM learning_cards`
+	var args []any
+	if skillID != "" {
+		query += ` WHERE skill_id = ?`
+		args = append(args, skillID)
+	}
+	query += ` ORDER BY created_at, id`
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("store: list learning cards: %w", err)
+	}
+	defer rows.Close()
+
+	var cards []domain.LearningCard
+	for rows.Next() {
+		var card domain.LearningCard
+		var createdAt int64
+		if err := rows.Scan(
+			&card.ID, &card.SessionRef, &card.SkillID, &card.Kind, &card.Fingerprint,
+			&card.Summary, &card.Lesson, &card.Confidence, &createdAt,
+		); err != nil {
+			return nil, fmt.Errorf("store: scan learning card: %w", err)
+		}
+		card.CreatedAt = fromUnixNano(createdAt)
+		cards = append(cards, card)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate learning cards: %w", err)
+	}
+	return cards, nil
+}
+
+// RebuildClusters atomically recomputes card and distinct-session counts while
+// preserving each cluster's workflow status. It returns clusters meeting the
+// requested distinct-session threshold.
+func (s *Store) RebuildClusters(ctx context.Context, minimumSessions int) ([]domain.Cluster, error) {
+	if minimumSessions < 1 {
+		return nil, errors.New("store: minimum sessions must be positive")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("store: begin cluster rebuild: %w", err)
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.QueryContext(ctx, `
+		SELECT skill_id, kind, fingerprint, COUNT(*), COUNT(DISTINCT session_ref)
+		FROM learning_cards
+		GROUP BY skill_id, kind, fingerprint
+		ORDER BY skill_id, kind, fingerprint`)
+	if err != nil {
+		return nil, fmt.Errorf("store: group learning cards: %w", err)
+	}
+	type groupedCards struct {
+		skillID, kind, fingerprint string
+		cardCount, sessionCount    int
+	}
+	var groups []groupedCards
+	for rows.Next() {
+		var group groupedCards
+		if err := rows.Scan(&group.skillID, &group.kind, &group.fingerprint, &group.cardCount, &group.sessionCount); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("store: scan grouped cards: %w", err)
+		}
+		groups = append(groups, group)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("store: close grouped cards: %w", err)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate grouped cards: %w", err)
+	}
+
+	updatedAt := unixNano(s.now())
+	for _, group := range groups {
+		var summary, lesson string
+		if err := tx.QueryRowContext(ctx, `
+			SELECT summary, lesson
+			FROM learning_cards
+			WHERE skill_id = ? AND kind = ? AND fingerprint = ?
+			ORDER BY created_at DESC, id DESC LIMIT 1`,
+			group.skillID, group.kind, group.fingerprint,
+		).Scan(&summary, &lesson); err != nil {
+			return nil, fmt.Errorf("store: select cluster representative: %w", err)
+		}
+		_, err := tx.ExecContext(ctx, `
+			INSERT INTO clusters (
+				id, skill_id, kind, fingerprint, summary, lesson,
+				card_count, session_count, status, updated_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(skill_id, kind, fingerprint) DO UPDATE SET
+				summary = excluded.summary,
+				lesson = excluded.lesson,
+				card_count = excluded.card_count,
+				session_count = excluded.session_count,
+				updated_at = excluded.updated_at`,
+			clusterID(group.skillID, group.kind, group.fingerprint), group.skillID, group.kind,
+			group.fingerprint, summary, lesson, group.cardCount, group.sessionCount,
+			domain.ClusterOpen, updatedAt,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("store: upsert cluster: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("store: commit cluster rebuild: %w", err)
+	}
+	return s.ListClusters(ctx, minimumSessions)
+}
+
+func (s *Store) ListClusters(ctx context.Context, minimumSessions int) ([]domain.Cluster, error) {
+	if minimumSessions < 0 {
+		return nil, errors.New("store: minimum sessions cannot be negative")
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, skill_id, kind, fingerprint, summary, lesson,
+		       card_count, session_count, status, updated_at
+		FROM clusters
+		WHERE session_count >= ?
+		ORDER BY updated_at DESC, id`, minimumSessions)
+	if err != nil {
+		return nil, fmt.Errorf("store: list clusters: %w", err)
+	}
+	defer rows.Close()
+
+	var clusters []domain.Cluster
+	for rows.Next() {
+		cluster, err := scanCluster(rows)
+		if err != nil {
+			return nil, err
+		}
+		clusters = append(clusters, cluster)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate clusters: %w", err)
+	}
+	return clusters, nil
+}
+
+func (s *Store) UpdateClusterStatus(ctx context.Context, id string, status domain.ClusterStatus) error {
+	if !validClusterStatus(status) {
+		return fmt.Errorf("store: invalid cluster status %q", status)
+	}
+	result, err := s.db.ExecContext(ctx,
+		`UPDATE clusters SET status = ?, updated_at = ? WHERE id = ?`,
+		status, unixNano(s.now()), id,
+	)
+	if err != nil {
+		return fmt.Errorf("store: update cluster status: %w", err)
+	}
+	return expectChanged(result)
+}
+
+func (s *Store) EnqueueJob(ctx context.Context, job domain.Job) (bool, error) {
+	if job.ID == "" || job.Kind == "" || job.IdempotencyKey == "" {
+		return false, errors.New("store: job id, kind, and idempotency key are required")
+	}
+	if job.Status == "" {
+		job.Status = domain.JobQueued
+	}
+	if job.Status != domain.JobQueued {
+		return false, errors.New("store: new jobs must be queued")
+	}
+	now := s.now()
+	availableAt := timeOrNow(job.AvailableAt, func() time.Time { return now })
+	createdAt := timeOrNow(job.CreatedAt, func() time.Time { return now })
+	result, err := s.db.ExecContext(ctx, `
+		INSERT INTO jobs (
+			id, kind, idempotency_key, payload, status, attempts,
+			available_at, leased_until, last_error, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, 0, ?, NULL, '', ?, ?)
+		ON CONFLICT(idempotency_key) DO NOTHING`,
+		job.ID, job.Kind, job.IdempotencyKey, job.Payload, domain.JobQueued,
+		unixNano(availableAt), unixNano(createdAt), unixNano(now),
+	)
+	if err != nil {
+		return false, fmt.Errorf("store: enqueue job: %w", err)
+	}
+	return rowsChanged(result)
+}
+
+// ClaimJobs leases queued work and expired leases in one SQLite statement.
+func (s *Store) ClaimJobs(ctx context.Context, limit int, lease time.Duration) ([]domain.Job, error) {
+	if limit < 1 || lease <= 0 {
+		return nil, errors.New("store: claim limit and lease must be positive")
+	}
+	now := s.now()
+	rows, err := s.db.QueryContext(ctx, `
+		UPDATE jobs
+		SET status = ?, attempts = attempts + 1, leased_until = ?, updated_at = ?
+		WHERE id IN (
+			SELECT id FROM jobs
+			WHERE (status = ? AND available_at <= ?)
+			   OR (status = ? AND leased_until <= ?)
+			ORDER BY available_at, created_at, id
+			LIMIT ?
+		)
+		RETURNING id, kind, idempotency_key, payload, status, attempts,
+		          available_at, leased_until, last_error, created_at, updated_at`,
+		domain.JobProcessing, unixNano(now.Add(lease)), unixNano(now),
+		domain.JobQueued, unixNano(now), domain.JobProcessing, unixNano(now), limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("store: claim jobs: %w", err)
+	}
+	defer rows.Close()
+
+	var jobs []domain.Job
+	for rows.Next() {
+		job, err := scanJob(rows)
+		if err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, job)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate claimed jobs: %w", err)
+	}
+	sort.Slice(jobs, func(i, j int) bool {
+		if jobs[i].AvailableAt.Equal(jobs[j].AvailableAt) {
+			return jobs[i].ID < jobs[j].ID
+		}
+		return jobs[i].AvailableAt.Before(jobs[j].AvailableAt)
+	})
+	return jobs, nil
+}
+
+func (s *Store) CompleteJob(ctx context.Context, id string) error {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE jobs SET status = ?, leased_until = NULL, last_error = '', updated_at = ?
+		WHERE id = ? AND status = ?`,
+		domain.JobCompleted, unixNano(s.now()), id, domain.JobProcessing,
+	)
+	if err != nil {
+		return fmt.Errorf("store: complete job: %w", err)
+	}
+	return expectChanged(result)
+}
+
+func (s *Store) RetryJob(ctx context.Context, id, message string, availableAt time.Time, terminal bool) error {
+	status := domain.JobQueued
+	if terminal {
+		status = domain.JobFailed
+	}
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE jobs
+		SET status = ?, available_at = ?, leased_until = NULL, last_error = ?, updated_at = ?
+		WHERE id = ? AND status = ?`,
+		status, unixNano(timeOrNow(availableAt, s.now)), message, unixNano(s.now()), id, domain.JobProcessing,
+	)
+	if err != nil {
+		return fmt.Errorf("store: retry job: %w", err)
+	}
+	return expectChanged(result)
+}
+
+func (s *Store) SaveProposal(ctx context.Context, proposal domain.Proposal) error {
+	if proposal.ID == "" || proposal.ClusterID == "" || proposal.SkillID == "" || proposal.RepositoryPath == "" {
+		return errors.New("store: proposal id, cluster, skill, and repository path are required")
+	}
+	if !validProposalStatus(proposal.Status) {
+		return fmt.Errorf("store: invalid proposal status %q", proposal.Status)
+	}
+	now := s.now()
+	createdAt := timeOrNow(proposal.CreatedAt, func() time.Time { return now })
+	updatedAt := timeOrNow(proposal.UpdatedAt, func() time.Time { return now })
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO proposals (
+			id, cluster_id, skill_id, status, repository_path, worktree_path,
+			branch, base_commit, candidate_commit, baseline_score, candidate_score,
+			previous_commit, promoted_commit, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			status = excluded.status,
+			worktree_path = excluded.worktree_path,
+			branch = excluded.branch,
+			base_commit = excluded.base_commit,
+			candidate_commit = excluded.candidate_commit,
+			baseline_score = excluded.baseline_score,
+			candidate_score = excluded.candidate_score,
+			previous_commit = excluded.previous_commit,
+			promoted_commit = excluded.promoted_commit,
+			updated_at = excluded.updated_at`,
+		proposal.ID, proposal.ClusterID, proposal.SkillID, proposal.Status,
+		proposal.RepositoryPath, proposal.WorktreePath, proposal.Branch,
+		proposal.BaseCommit, proposal.CandidateCommit, proposal.BaselineScore,
+		proposal.CandidateScore, proposal.PreviousCommit, proposal.PromotedCommit,
+		unixNano(createdAt), unixNano(updatedAt),
+	)
+	if err != nil {
+		return fmt.Errorf("store: save proposal: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) Proposal(ctx context.Context, id string) (domain.Proposal, error) {
+	row := s.db.QueryRowContext(ctx, proposalSelect+` WHERE id = ?`, id)
+	proposal, err := scanProposal(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.Proposal{}, ErrNotFound
+	}
+	if err != nil {
+		return domain.Proposal{}, err
+	}
+	return proposal, nil
+}
+
+func (s *Store) ListProposals(ctx context.Context, status domain.ProposalStatus) ([]domain.Proposal, error) {
+	query := proposalSelect
+	var args []any
+	if status != "" {
+		if !validProposalStatus(status) {
+			return nil, fmt.Errorf("store: invalid proposal status %q", status)
+		}
+		query += ` WHERE status = ?`
+		args = append(args, status)
+	}
+	query += ` ORDER BY created_at DESC, id`
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("store: list proposals: %w", err)
+	}
+	defer rows.Close()
+
+	var proposals []domain.Proposal
+	for rows.Next() {
+		proposal, err := scanProposal(rows)
+		if err != nil {
+			return nil, err
+		}
+		proposals = append(proposals, proposal)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate proposals: %w", err)
+	}
+	return proposals, nil
+}
+
+func (s *Store) UpdateProposalStatus(ctx context.Context, id string, status domain.ProposalStatus) error {
+	if !validProposalStatus(status) {
+		return fmt.Errorf("store: invalid proposal status %q", status)
+	}
+	result, err := s.db.ExecContext(ctx,
+		`UPDATE proposals SET status = ?, updated_at = ? WHERE id = ?`,
+		status, unixNano(s.now()), id,
+	)
+	if err != nil {
+		return fmt.Errorf("store: update proposal status: %w", err)
+	}
+	return expectChanged(result)
+}
+
+func (s *Store) DeleteProposal(ctx context.Context, id string) error {
+	result, err := s.db.ExecContext(ctx, `DELETE FROM proposals WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("store: delete proposal: %w", err)
+	}
+	return expectChanged(result)
+}
+
+func (s *Store) RecordEvaluationResult(ctx context.Context, result domain.EvaluationResult) (bool, error) {
+	if result.ID == "" || result.ProposalID == "" || !validEvaluationVariant(result.Variant) {
+		return false, errors.New("store: evaluation id, proposal, and valid variant are required")
+	}
+	inserted, err := s.db.ExecContext(ctx, `
+		INSERT INTO evaluation_results (
+			id, proposal_id, variant, passed, score, duration_ns, details, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO NOTHING`,
+		result.ID, result.ProposalID, result.Variant, boolInt(result.Passed), result.Score,
+		int64(result.Duration), result.Details, unixNano(timeOrNow(result.CreatedAt, s.now)),
+	)
+	if err != nil {
+		return false, fmt.Errorf("store: record evaluation result: %w", err)
+	}
+	return rowsChanged(inserted)
+}
+
+func (s *Store) ListEvaluationResults(ctx context.Context, proposalID string) ([]domain.EvaluationResult, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, proposal_id, variant, passed, score, duration_ns, details, created_at
+		FROM evaluation_results WHERE proposal_id = ? ORDER BY created_at, id`, proposalID)
+	if err != nil {
+		return nil, fmt.Errorf("store: list evaluation results: %w", err)
+	}
+	defer rows.Close()
+
+	var results []domain.EvaluationResult
+	for rows.Next() {
+		var result domain.EvaluationResult
+		var passed int
+		var duration, createdAt int64
+		if err := rows.Scan(
+			&result.ID, &result.ProposalID, &result.Variant, &passed, &result.Score,
+			&duration, &result.Details, &createdAt,
+		); err != nil {
+			return nil, fmt.Errorf("store: scan evaluation result: %w", err)
+		}
+		result.Passed = passed != 0
+		result.Duration = time.Duration(duration)
+		result.CreatedAt = fromUnixNano(createdAt)
+		results = append(results, result)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate evaluation results: %w", err)
+	}
+	return results, nil
+}
+
+// RecordPromotion atomically deactivates the previous release for a skill and
+// marks the corresponding proposal promoted.
+func (s *Store) RecordPromotion(ctx context.Context, promotion domain.Promotion) error {
+	if promotion.ID == "" || promotion.ProposalID == "" || promotion.SkillID == "" || promotion.PromotedCommit == "" {
+		return errors.New("store: promotion id, proposal, skill, and promoted commit are required")
+	}
+	if promotion.MonitorStatus == "" {
+		promotion.MonitorStatus = domain.MonitorPending
+	}
+	if !validMonitorStatus(promotion.MonitorStatus) {
+		return fmt.Errorf("store: invalid monitor status %q", promotion.MonitorStatus)
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("store: begin promotion: %w", err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx, `UPDATE promotions SET active = 0 WHERE skill_id = ?`, promotion.SkillID); err != nil {
+		return fmt.Errorf("store: deactivate previous promotion: %w", err)
+	}
+	promotedAt := timeOrNow(promotion.PromotedAt, s.now)
+	lastMonitoredAt := nullableTime(promotion.LastMonitoredAt)
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO promotions (
+			id, proposal_id, skill_id, previous_commit, promoted_commit,
+			active, monitor_status, promoted_at, last_monitored_at
+		) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			active = 1,
+			monitor_status = excluded.monitor_status,
+			last_monitored_at = excluded.last_monitored_at`,
+		promotion.ID, promotion.ProposalID, promotion.SkillID, promotion.PreviousCommit,
+		promotion.PromotedCommit, promotion.MonitorStatus, unixNano(promotedAt), lastMonitoredAt,
+	); err != nil {
+		return fmt.Errorf("store: insert promotion: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE proposals SET status = ?, promoted_commit = ?, previous_commit = ?, updated_at = ?
+		WHERE id = ?`,
+		domain.ProposalPromoted, promotion.PromotedCommit, promotion.PreviousCommit,
+		unixNano(s.now()), promotion.ProposalID,
+	); err != nil {
+		return fmt.Errorf("store: mark proposal promoted: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("store: commit promotion: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) ActivePromotion(ctx context.Context, skillID string) (domain.Promotion, error) {
+	row := s.db.QueryRowContext(ctx, promotionSelect+` WHERE skill_id = ? AND active = 1`, skillID)
+	promotion, err := scanPromotion(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.Promotion{}, ErrNotFound
+	}
+	if err != nil {
+		return domain.Promotion{}, err
+	}
+	return promotion, nil
+}
+
+func (s *Store) Promotion(ctx context.Context, id string) (domain.Promotion, error) {
+	row := s.db.QueryRowContext(ctx, promotionSelect+` WHERE id = ?`, id)
+	promotion, err := scanPromotion(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.Promotion{}, ErrNotFound
+	}
+	if err != nil {
+		return domain.Promotion{}, err
+	}
+	return promotion, nil
+}
+
+func (s *Store) ListPromotions(ctx context.Context, activeOnly bool) ([]domain.Promotion, error) {
+	query := promotionSelect
+	if activeOnly {
+		query += ` WHERE active = 1`
+	}
+	query += ` ORDER BY promoted_at DESC, id`
+	rows, err := s.db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("store: list promotions: %w", err)
+	}
+	defer rows.Close()
+
+	var promotions []domain.Promotion
+	for rows.Next() {
+		promotion, err := scanPromotion(rows)
+		if err != nil {
+			return nil, err
+		}
+		promotions = append(promotions, promotion)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate promotions: %w", err)
+	}
+	return promotions, nil
+}
+
+func (s *Store) UpdatePromotionMonitor(ctx context.Context, id string, status domain.MonitorStatus) error {
+	if !validMonitorStatus(status) {
+		return fmt.Errorf("store: invalid monitor status %q", status)
+	}
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE promotions SET monitor_status = ?, last_monitored_at = ? WHERE id = ?`,
+		status, unixNano(s.now()), id,
+	)
+	if err != nil {
+		return fmt.Errorf("store: update promotion monitor: %w", err)
+	}
+	return expectChanged(result)
+}
+
+// RecordRollback records the rollback and deactivates the promoted revision in
+// the same transaction. Filesystem activation remains the release module's job.
+func (s *Store) RecordRollback(ctx context.Context, rollback domain.Rollback) error {
+	if rollback.ID == "" || rollback.PromotionID == "" || rollback.FromCommit == "" || rollback.ToCommit == "" || rollback.Reason == "" || rollback.Actor == "" {
+		return errors.New("store: rollback id, promotion, commits, reason, and actor are required")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("store: begin rollback: %w", err)
+	}
+	defer tx.Rollback()
+
+	createdAt := timeOrNow(rollback.CreatedAt, s.now)
+	inserted, err := tx.ExecContext(ctx, `
+		INSERT INTO rollbacks (
+			id, promotion_id, from_commit, to_commit, reason, actor, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO NOTHING`,
+		rollback.ID, rollback.PromotionID, rollback.FromCommit, rollback.ToCommit,
+		rollback.Reason, rollback.Actor, unixNano(createdAt),
+	)
+	if err != nil {
+		return fmt.Errorf("store: insert rollback: %w", err)
+	}
+	created, err := rowsChanged(inserted)
+	if err != nil {
+		return err
+	}
+	if !created {
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("store: commit existing rollback: %w", err)
+		}
+		return nil
+	}
+	result, err := tx.ExecContext(ctx, `
+		UPDATE promotions SET active = 0, monitor_status = ? WHERE id = ? AND active = 1`,
+		domain.MonitorRolledBack, rollback.PromotionID,
+	)
+	if err != nil {
+		return fmt.Errorf("store: deactivate rolled back promotion: %w", err)
+	}
+	changed, err := rowsChanged(result)
+	if err != nil {
+		return err
+	}
+	if !changed {
+		return ErrNotFound
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE proposals SET status = ?, updated_at = ?
+		WHERE id = (SELECT proposal_id FROM promotions WHERE id = ?)`,
+		domain.ProposalRolledBack, unixNano(s.now()), rollback.PromotionID,
+	); err != nil {
+		return fmt.Errorf("store: mark proposal rolled back: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("store: commit rollback: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) ListRollbacks(ctx context.Context, promotionID string) ([]domain.Rollback, error) {
+	query := `
+		SELECT id, promotion_id, from_commit, to_commit, reason, actor, created_at
+		FROM rollbacks`
+	var args []any
+	if promotionID != "" {
+		query += ` WHERE promotion_id = ?`
+		args = append(args, promotionID)
+	}
+	query += ` ORDER BY created_at DESC, id`
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("store: list rollbacks: %w", err)
+	}
+	defer rows.Close()
+
+	var rollbacks []domain.Rollback
+	for rows.Next() {
+		var rollback domain.Rollback
+		var createdAt int64
+		if err := rows.Scan(
+			&rollback.ID, &rollback.PromotionID, &rollback.FromCommit, &rollback.ToCommit,
+			&rollback.Reason, &rollback.Actor, &createdAt,
+		); err != nil {
+			return nil, fmt.Errorf("store: scan rollback: %w", err)
+		}
+		rollback.CreatedAt = fromUnixNano(createdAt)
+		rollbacks = append(rollbacks, rollback)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate rollbacks: %w", err)
+	}
+	return rollbacks, nil
+}
+
+func (s *Store) AppendAudit(ctx context.Context, entry domain.AuditEntry) (domain.AuditEntry, error) {
+	if entry.Action == "" || entry.EntityType == "" || entry.EntityID == "" || entry.Actor == "" {
+		return domain.AuditEntry{}, errors.New("store: audit action, entity type, entity id, and actor are required")
+	}
+	entry.CreatedAt = timeOrNow(entry.CreatedAt, s.now)
+	result, err := s.db.ExecContext(ctx, `
+		INSERT INTO audit_log (action, entity_type, entity_id, actor, details, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)`,
+		entry.Action, entry.EntityType, entry.EntityID, entry.Actor, entry.Details, unixNano(entry.CreatedAt),
+	)
+	if err != nil {
+		return domain.AuditEntry{}, fmt.Errorf("store: append audit: %w", err)
+	}
+	entry.ID, err = result.LastInsertId()
+	if err != nil {
+		return domain.AuditEntry{}, fmt.Errorf("store: read audit id: %w", err)
+	}
+	return entry, nil
+}
+
+func (s *Store) ListAudit(ctx context.Context, entityType, entityID string) ([]domain.AuditEntry, error) {
+	query := `SELECT id, action, entity_type, entity_id, actor, details, created_at FROM audit_log`
+	var args []any
+	if entityType != "" || entityID != "" {
+		query += ` WHERE entity_type = ? AND entity_id = ?`
+		args = append(args, entityType, entityID)
+	}
+	query += ` ORDER BY id DESC`
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("store: list audit: %w", err)
+	}
+	defer rows.Close()
+
+	var entries []domain.AuditEntry
+	for rows.Next() {
+		var entry domain.AuditEntry
+		var createdAt int64
+		if err := rows.Scan(
+			&entry.ID, &entry.Action, &entry.EntityType, &entry.EntityID,
+			&entry.Actor, &entry.Details, &createdAt,
+		); err != nil {
+			return nil, fmt.Errorf("store: scan audit entry: %w", err)
+		}
+		entry.CreatedAt = fromUnixNano(createdAt)
+		entries = append(entries, entry)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate audit entries: %w", err)
+	}
+	return entries, nil
+}
+
+func (s *Store) Counts(ctx context.Context, eligibleMinimumSessions int) (Counts, error) {
+	if eligibleMinimumSessions < 1 {
+		return Counts{}, errors.New("store: eligible minimum sessions must be positive")
+	}
+	counts := Counts{
+		Jobs:      make(map[domain.JobStatus]int),
+		Proposals: make(map[domain.ProposalStatus]int),
+	}
+	queries := []struct {
+		query string
+		args  []any
+		dest  *int
+	}{
+		{`SELECT COUNT(*) FROM sessions`, nil, &counts.Sessions},
+		{`SELECT COUNT(*) FROM skills`, nil, &counts.Skills},
+		{`SELECT COUNT(*) FROM learning_cards`, nil, &counts.Cards},
+		{`SELECT COUNT(*) FROM clusters`, nil, &counts.Clusters},
+		{`SELECT COUNT(*) FROM clusters WHERE session_count >= ?`, []any{eligibleMinimumSessions}, &counts.EligibleClusters},
+		{`SELECT COUNT(*) FROM promotions WHERE active = 1`, nil, &counts.ActivePromotions},
+		{`SELECT COUNT(*) FROM rollbacks`, nil, &counts.Rollbacks},
+	}
+	for _, item := range queries {
+		if err := s.db.QueryRowContext(ctx, item.query, item.args...).Scan(item.dest); err != nil {
+			return Counts{}, fmt.Errorf("store: count state: %w", err)
+		}
+	}
+	if err := countStatuses(ctx, s.db, `SELECT status, COUNT(*) FROM jobs GROUP BY status`, func(status string, count int) {
+		counts.Jobs[domain.JobStatus(status)] = count
+	}); err != nil {
+		return Counts{}, err
+	}
+	if err := countStatuses(ctx, s.db, `SELECT status, COUNT(*) FROM proposals GROUP BY status`, func(status string, count int) {
+		counts.Proposals[domain.ProposalStatus(status)] = count
+	}); err != nil {
+		return Counts{}, err
+	}
+	return counts, nil
+}
+
+const proposalSelect = `
+	SELECT id, cluster_id, skill_id, status, repository_path, worktree_path,
+	       branch, base_commit, candidate_commit, baseline_score, candidate_score,
+	       previous_commit, promoted_commit, created_at, updated_at
+	FROM proposals`
+
+const promotionSelect = `
+	SELECT id, proposal_id, skill_id, previous_commit, promoted_commit,
+	       active, monitor_status, promoted_at, last_monitored_at
+	FROM promotions`
+
+type scanner interface {
+	Scan(dest ...any) error
+}
+
+func scanCluster(row scanner) (domain.Cluster, error) {
+	var cluster domain.Cluster
+	var updatedAt int64
+	if err := row.Scan(
+		&cluster.ID, &cluster.SkillID, &cluster.Kind, &cluster.Fingerprint,
+		&cluster.Summary, &cluster.Lesson, &cluster.CardCount, &cluster.SessionCount,
+		&cluster.Status, &updatedAt,
+	); err != nil {
+		return domain.Cluster{}, fmt.Errorf("store: scan cluster: %w", err)
+	}
+	cluster.UpdatedAt = fromUnixNano(updatedAt)
+	return cluster, nil
+}
+
+func scanProposal(row scanner) (domain.Proposal, error) {
+	var proposal domain.Proposal
+	var createdAt, updatedAt int64
+	if err := row.Scan(
+		&proposal.ID, &proposal.ClusterID, &proposal.SkillID, &proposal.Status,
+		&proposal.RepositoryPath, &proposal.WorktreePath, &proposal.Branch,
+		&proposal.BaseCommit, &proposal.CandidateCommit, &proposal.BaselineScore,
+		&proposal.CandidateScore, &proposal.PreviousCommit, &proposal.PromotedCommit,
+		&createdAt, &updatedAt,
+	); err != nil {
+		return domain.Proposal{}, fmt.Errorf("store: scan proposal: %w", err)
+	}
+	proposal.CreatedAt = fromUnixNano(createdAt)
+	proposal.UpdatedAt = fromUnixNano(updatedAt)
+	return proposal, nil
+}
+
+func scanPromotion(row scanner) (domain.Promotion, error) {
+	var promotion domain.Promotion
+	var active int
+	var promotedAt int64
+	var lastMonitoredAt sql.NullInt64
+	if err := row.Scan(
+		&promotion.ID, &promotion.ProposalID, &promotion.SkillID,
+		&promotion.PreviousCommit, &promotion.PromotedCommit, &active,
+		&promotion.MonitorStatus, &promotedAt, &lastMonitoredAt,
+	); err != nil {
+		return domain.Promotion{}, fmt.Errorf("store: scan promotion: %w", err)
+	}
+	promotion.Active = active != 0
+	promotion.PromotedAt = fromUnixNano(promotedAt)
+	if lastMonitoredAt.Valid {
+		promotion.LastMonitoredAt = fromUnixNano(lastMonitoredAt.Int64)
+	}
+	return promotion, nil
+}
+
+func scanJob(row scanner) (domain.Job, error) {
+	var job domain.Job
+	var availableAt, createdAt, updatedAt int64
+	var leasedUntil sql.NullInt64
+	if err := row.Scan(
+		&job.ID, &job.Kind, &job.IdempotencyKey, &job.Payload, &job.Status,
+		&job.Attempts, &availableAt, &leasedUntil, &job.LastError, &createdAt, &updatedAt,
+	); err != nil {
+		return domain.Job{}, fmt.Errorf("store: scan job: %w", err)
+	}
+	job.AvailableAt = fromUnixNano(availableAt)
+	if leasedUntil.Valid {
+		job.LeasedUntil = fromUnixNano(leasedUntil.Int64)
+	}
+	job.CreatedAt = fromUnixNano(createdAt)
+	job.UpdatedAt = fromUnixNano(updatedAt)
+	return job, nil
+}
+
+func countStatuses(ctx context.Context, db *sql.DB, query string, set func(string, int)) error {
+	rows, err := db.QueryContext(ctx, query)
+	if err != nil {
+		return fmt.Errorf("store: count statuses: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var status string
+		var count int
+		if err := rows.Scan(&status, &count); err != nil {
+			return fmt.Errorf("store: scan status count: %w", err)
+		}
+		set(status, count)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("store: iterate status counts: %w", err)
+	}
+	return nil
+}
+
+func clusterID(skillID, kind, fingerprint string) string {
+	sum := sha256.Sum256([]byte(skillID + "\x00" + kind + "\x00" + fingerprint))
+	return fmt.Sprintf("cluster-%x", sum[:12])
+}
+
+func rowsChanged(result sql.Result) (bool, error) {
+	count, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("store: read affected rows: %w", err)
+	}
+	return count > 0, nil
+}
+
+func expectChanged(result sql.Result) error {
+	changed, err := rowsChanged(result)
+	if err != nil {
+		return err
+	}
+	if !changed {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func unixNano(value time.Time) int64 {
+	return value.UTC().UnixNano()
+}
+
+func fromUnixNano(value int64) time.Time {
+	return time.Unix(0, value).UTC()
+}
+
+func nullableTime(value time.Time) any {
+	if value.IsZero() {
+		return nil
+	}
+	return unixNano(value)
+}
+
+func timeOrNow(value time.Time, now func() time.Time) time.Time {
+	if value.IsZero() {
+		return now().UTC()
+	}
+	return value.UTC()
+}
+
+func boolInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
+}
+
+func validCardKind(kind domain.CardKind) bool {
+	return kind == domain.CardCorrection || kind == domain.CardFailure || kind == domain.CardValidation
+}
+
+func validClusterStatus(status domain.ClusterStatus) bool {
+	return status == domain.ClusterOpen || status == domain.ClusterProposed || status == domain.ClusterResolved
+}
+
+func validProposalStatus(status domain.ProposalStatus) bool {
+	switch status {
+	case domain.ProposalPending, domain.ProposalEvaluated, domain.ProposalApproved,
+		domain.ProposalPromoted, domain.ProposalRejected, domain.ProposalRolledBack:
+		return true
+	default:
+		return false
+	}
+}
+
+func validEvaluationVariant(variant domain.EvaluationVariant) bool {
+	return variant == domain.EvaluationBaseline || variant == domain.EvaluationCandidate
+}
+
+func validMonitorStatus(status domain.MonitorStatus) bool {
+	return status == domain.MonitorPending || status == domain.MonitorHealthy ||
+		status == domain.MonitorRegressing || status == domain.MonitorRolledBack
+}
