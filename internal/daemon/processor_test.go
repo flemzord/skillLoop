@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -201,5 +202,149 @@ func TestDrainClaimsTheJobMatchingTheCurrentSpoolEvent(t *testing.T) {
 	claimed, ok, err := database.ClaimJob(ctx, oldJob.ID, time.Minute)
 	if err != nil || !ok || claimed.ID != oldJob.ID {
 		t.Fatalf("older job should remain queued: job=%#v ok=%v err=%v", claimed, ok, err)
+	}
+}
+
+func TestDrainPrunesOnlyExpiredOperationalData(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	database, err := store.Open(ctx, filepath.Join(dataDir, "skillloop.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+
+	transcriptPath := filepath.Join(dataDir, "source-transcript.jsonl")
+	if err := os.WriteFile(transcriptPath, []byte("source remains local"), 0o600); err != nil {
+		t.Fatalf("write source transcript: %v", err)
+	}
+	session := domain.Session{
+		Reference: "retained-session", Source: domain.SourceCodex, ExternalID: "retained-session",
+		TranscriptPath: transcriptPath, Outcome: domain.SessionOutcomeSucceeded,
+	}
+	if created, err := database.RecordSession(ctx, session); err != nil || !created {
+		t.Fatalf("record session: created=%v err=%v", created, err)
+	}
+	job := domain.Job{ID: "old-completed", Kind: ingestJobKind, IdempotencyKey: "hook:old-completed", Payload: "old"}
+	if created, err := database.EnqueueJob(ctx, job); err != nil || !created {
+		t.Fatalf("enqueue job: created=%v err=%v", created, err)
+	}
+	if _, claimed, err := database.ClaimJob(ctx, job.ID, time.Minute); err != nil || !claimed {
+		t.Fatalf("claim job: claimed=%v err=%v", claimed, err)
+	}
+	if err := database.CompleteJob(ctx, job.ID); err != nil {
+		t.Fatalf("complete job: %v", err)
+	}
+
+	directories, err := ensureSpoolDirectories(dataDir)
+	if err != nil {
+		t.Fatalf("create spool: %v", err)
+	}
+	oldJSON := filepath.Join(directories.failed, "old.json")
+	recentJSON := filepath.Join(directories.failed, "recent.json")
+	oldNonJSON := filepath.Join(directories.failed, "old.txt")
+	for _, path := range []string{oldJSON, recentJSON, oldNonJSON} {
+		if err := os.WriteFile(path, []byte("failed event"), 0o600); err != nil {
+			t.Fatalf("write failed spool fixture: %v", err)
+		}
+	}
+	realTarget := filepath.Join(dataDir, "outside-target")
+	if err := os.WriteFile(realTarget, []byte("do not follow"), 0o600); err != nil {
+		t.Fatalf("write symlink target: %v", err)
+	}
+	linkedJSON := filepath.Join(directories.failed, "linked.json")
+	if err := os.Symlink(realTarget, linkedJSON); err != nil {
+		t.Fatalf("create failed spool symlink: %v", err)
+	}
+
+	recordedAt := time.Now()
+	oldTime := recordedAt.Add(-48 * time.Hour)
+	processorNow := recordedAt.Add(48 * time.Hour)
+	if err := os.Chtimes(oldJSON, oldTime, oldTime); err != nil {
+		t.Fatalf("age old json: %v", err)
+	}
+	if err := os.Chtimes(recentJSON, processorNow.Add(-time.Hour), processorNow.Add(-time.Hour)); err != nil {
+		t.Fatalf("set recent json time: %v", err)
+	}
+	if err := os.Chtimes(oldNonJSON, oldTime, oldTime); err != nil {
+		t.Fatalf("age old non-json: %v", err)
+	}
+
+	settings, err := config.Default()
+	if err != nil {
+		t.Fatalf("default config: %v", err)
+	}
+	settings.DataDir = dataDir
+	settings.Retention = config.Retention{
+		TranscriptLocators: 24 * time.Hour,
+		FailedSpool:        24 * time.Hour,
+		CompletedJobs:      24 * time.Hour,
+		FailedJobs:         24 * time.Hour,
+	}
+	result, err := (Processor{Config: settings, Store: database, Now: func() time.Time { return processorNow }}).Drain(ctx, 10)
+	if err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if result.PrunedTranscriptLocators != 1 || result.PrunedCompletedJobs != 1 || result.PrunedFailedJobs != 0 || result.PrunedFailedSpool != 1 {
+		t.Fatalf("retention result = %#v", result)
+	}
+	counts, err := database.Counts(ctx, settings.Aggregation.MinimumSessions)
+	if err != nil || counts.Sessions != 1 || len(counts.Jobs) != 0 {
+		t.Fatalf("durable counts=%#v err=%v", counts, err)
+	}
+	for _, path := range []string{transcriptPath, recentJSON, oldNonJSON, linkedJSON, realTarget} {
+		if _, err := os.Lstat(path); err != nil {
+			t.Fatalf("expected retained path %s: %v", path, err)
+		}
+	}
+	if _, err := os.Lstat(oldJSON); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expired failed json still exists: %v", err)
+	}
+}
+
+func TestDrainRetentionZeroKeepsOperationalDataIndefinitely(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	database, err := store.Open(ctx, filepath.Join(dataDir, "skillloop.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	session := domain.Session{
+		Reference: "indefinite", Source: domain.SourceClaude, ExternalID: "indefinite",
+		TranscriptPath: filepath.Join(dataDir, "transcript.jsonl"),
+	}
+	if created, err := database.RecordSession(ctx, session); err != nil || !created {
+		t.Fatalf("record session: created=%v err=%v", created, err)
+	}
+	directories, err := ensureSpoolDirectories(dataDir)
+	if err != nil {
+		t.Fatalf("create spool: %v", err)
+	}
+	failedPath := filepath.Join(directories.failed, "forever.json")
+	if err := os.WriteFile(failedPath, []byte("failed"), 0o600); err != nil {
+		t.Fatalf("write failed spool fixture: %v", err)
+	}
+	veryOld := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	if err := os.Chtimes(failedPath, veryOld, veryOld); err != nil {
+		t.Fatalf("age failed fixture: %v", err)
+	}
+	settings, err := config.Default()
+	if err != nil {
+		t.Fatalf("default config: %v", err)
+	}
+	settings.DataDir = dataDir
+	settings.Retention = config.Retention{}
+	result, err := (Processor{Config: settings, Store: database, Now: func() time.Time {
+		return time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
+	}}).Drain(ctx, 10)
+	if err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if result.PrunedTranscriptLocators != 0 || result.PrunedCompletedJobs != 0 || result.PrunedFailedJobs != 0 || result.PrunedFailedSpool != 0 {
+		t.Fatalf("retention result = %#v, want no pruning", result)
+	}
+	if _, err := os.Stat(failedPath); err != nil {
+		t.Fatalf("zero retention removed failed spool file: %v", err)
 	}
 }

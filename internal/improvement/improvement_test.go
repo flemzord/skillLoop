@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -18,7 +19,7 @@ func TestPrepareEvaluatePromoteAndRollback(t *testing.T) {
 	repository, skill := newTestRepository(t)
 	stateDir := t.TempDir()
 	t.Cleanup(func() { makeTestTreeWritable(stateDir) })
-	service := Service{StateDir: stateDir}
+	service := testServiceWithExternalRunner(t, stateDir)
 	cluster := testCluster(skill.ID)
 
 	sourceSkill := filepath.Join(repository, filepath.FromSlash(skill.InstructionPath))
@@ -160,6 +161,29 @@ func TestEvaluateUsesExternalRunnerForExactPairAndCapsOutput(t *testing.T) {
 	}
 }
 
+func TestPromoteRequiresExternalComparativeProof(t *testing.T) {
+	_, skill := newTestRepository(t)
+	service := Service{StateDir: t.TempDir()}
+	candidate, err := service.Prepare(context.Background(), skill, testCluster(skill.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = service.Cleanup(context.Background(), candidate) })
+	evaluation, err := service.Evaluate(context.Background(), candidate)
+	if err != nil || !evaluation.Passed {
+		t.Fatalf("structural evaluation: passed=%v err=%v", evaluation.Passed, err)
+	}
+	_, err = service.Promote(context.Background(), skill, candidate, evaluation, Approval{
+		BaseCommit: candidate.BaseCommit, CandidateCommit: candidate.CandidateCommit,
+	})
+	if !errors.Is(err, ErrExternalEvaluationRequired) {
+		t.Fatalf("promote error=%v, want ErrExternalEvaluationRequired", err)
+	}
+	if _, err := service.CurrentRelease(skill); !errors.Is(err, ErrNoRelease) {
+		t.Fatalf("structural-only evaluation created release: %v", err)
+	}
+}
+
 func TestExternalRunnerHelper(t *testing.T) {
 	if os.Getenv("SKILLLOOP_TEST_RUNNER") != "1" {
 		return
@@ -170,7 +194,14 @@ func TestExternalRunnerHelper(t *testing.T) {
 		os.Exit(2)
 	}
 	fmt.Print(strings.Repeat("x", 2048))
-	if !strings.Contains(string(contents), "<!-- skillloop:begin correction-loop -->") {
+	expectedMarkers := 1
+	if raw := os.Getenv("SKILLLOOP_TEST_EXPECTED_MARKERS"); raw != "" {
+		expectedMarkers, err = strconv.Atoi(raw)
+		if err != nil {
+			os.Exit(2)
+		}
+	}
+	if strings.Count(string(contents), "<!-- skillloop:begin ") < expectedMarkers {
 		os.Exit(1)
 	}
 }
@@ -291,7 +322,7 @@ func TestPromotionRefusesApprovalAndBaseDrift(t *testing.T) {
 
 	t.Run("repository head moved", func(t *testing.T) {
 		repository, skill := newTestRepository(t)
-		service := Service{StateDir: t.TempDir()}
+		service := testServiceWithExternalRunner(t, t.TempDir())
 		candidate, err := service.Prepare(context.Background(), skill, testCluster(skill.ID))
 		if err != nil {
 			t.Fatal(err)
@@ -318,7 +349,7 @@ func TestSequentialPromotionsUseCurrentReleaseAndRollbackOneStep(t *testing.T) {
 	repository, skill := newTestRepository(t)
 	stateDir := t.TempDir()
 	t.Cleanup(func() { makeTestTreeWritable(stateDir) })
-	service := Service{StateDir: stateDir}
+	service := testServiceWithExternalRunner(t, stateDir)
 	originalHead := testGit(t, repository, "rev-parse", "HEAD")
 	originalStatus := testGit(t, repository, "status", "--porcelain=v1")
 
@@ -337,10 +368,14 @@ func TestSequentialPromotionsUseCurrentReleaseAndRollbackOneStep(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := service.Promote(context.Background(), skill, first, firstEvaluation, Approval{
+	structuralOnlyEvaluation, err := (Service{StateDir: stateDir}).Evaluate(context.Background(), first)
+	if err != nil || !structuralOnlyEvaluation.Passed || structuralOnlyEvaluation.BaselineRun != nil {
+		t.Fatalf("structural-only reevaluation: %#v err=%v", structuralOnlyEvaluation, err)
+	}
+	if _, err := service.Promote(context.Background(), skill, first, structuralOnlyEvaluation, Approval{
 		BaseCommit: first.BaseCommit, CandidateCommit: first.CandidateCommit,
 	}); err != nil {
-		t.Fatalf("idempotent first promotion: %v", err)
+		t.Fatalf("idempotent existing promotion without new external proof: %v", err)
 	}
 	if err := service.Cleanup(context.Background(), first); err != nil {
 		t.Fatal(err)
@@ -357,6 +392,7 @@ func TestSequentialPromotionsUseCurrentReleaseAndRollbackOneStep(t *testing.T) {
 	if second.BaseCommit != first.CandidateCommit {
 		t.Fatalf("second base=%s, want current release %s", second.BaseCommit, first.CandidateCommit)
 	}
+	t.Setenv("SKILLLOOP_TEST_EXPECTED_MARKERS", "2")
 	secondEvaluation, err := service.Evaluate(context.Background(), second)
 	if err != nil || !secondEvaluation.Passed {
 		t.Fatalf("second evaluation: passed=%v err=%v", secondEvaluation.Passed, err)
@@ -389,6 +425,18 @@ func TestSequentialPromotionsUseCurrentReleaseAndRollbackOneStep(t *testing.T) {
 	}
 	if rolledBack.CurrentCommit != first.CandidateCommit {
 		t.Fatalf("rollback current=%s, want first candidate=%s", rolledBack.CurrentCommit, first.CandidateCommit)
+	}
+}
+
+func testServiceWithExternalRunner(t *testing.T, stateDir string) Service {
+	t.Helper()
+	t.Setenv("SKILLLOOP_TEST_RUNNER", "1")
+	return Service{
+		StateDir: stateDir,
+		Runner: Runner{
+			Argv:    []string{os.Args[0], "-test.run=^TestExternalRunnerHelper$"},
+			Timeout: 5 * time.Second,
+		},
 	}
 }
 

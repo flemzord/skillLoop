@@ -54,6 +54,18 @@ type Message struct {
 	Failed     bool
 }
 
+type SessionOutcome string
+
+const (
+	SessionOutcomeUnknown   SessionOutcome = "unknown"
+	SessionOutcomeSucceeded SessionOutcome = "succeeded"
+	SessionOutcomeFailed    SessionOutcome = "failed"
+)
+
+func (outcome SessionOutcome) Valid() bool {
+	return outcome == SessionOutcomeUnknown || outcome == SessionOutcomeSucceeded || outcome == SessionOutcomeFailed
+}
+
 type Session struct {
 	Reference      string
 	Source         Source
@@ -61,6 +73,7 @@ type Session struct {
 	TurnID         string
 	WorkingDir     string
 	TranscriptPath string
+	Outcome        SessionOutcome
 	Messages       []Message
 }
 

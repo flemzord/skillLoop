@@ -33,6 +33,12 @@ type Counts struct {
 	Proposals        map[domain.ProposalStatus]int
 }
 
+type RetentionPruneResult struct {
+	TranscriptLocators int
+	CompletedJobs      int
+	FailedJobs         int
+}
+
 // Store persists SkillLoop's durable metadata. Transcript contents deliberately
 // remain outside the database; sessions only retain their original locator.
 type Store struct {
@@ -158,14 +164,20 @@ func (s *Store) RecordSession(ctx context.Context, session domain.Session) (bool
 	if session.Reference == "" || !session.Source.Valid() || session.ExternalID == "" {
 		return false, errors.New("store: session reference, valid source, and external id are required")
 	}
+	if session.Outcome == "" {
+		session.Outcome = domain.SessionOutcomeUnknown
+	}
+	if !session.Outcome.Valid() {
+		return false, fmt.Errorf("store: invalid session outcome %q", session.Outcome)
+	}
 	now := s.now()
 	result, err := s.db.ExecContext(ctx, `
 		INSERT INTO sessions (
-			reference, source, external_id, turn_id, working_dir, transcript_path, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			reference, source, external_id, turn_id, working_dir, transcript_path, outcome, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(source, external_id) DO NOTHING`,
 		session.Reference, session.Source, session.ExternalID, session.TurnID, session.WorkingDir,
-		session.TranscriptPath, unixNano(now), unixNano(now),
+		session.TranscriptPath, session.Outcome, unixNano(now), unixNano(now),
 	)
 	if err != nil {
 		return false, fmt.Errorf("store: record session: %w", err)
@@ -196,11 +208,13 @@ func (s *Store) RecordSession(ctx context.Context, session domain.Session) (bool
 			turn_id = CASE WHEN ? <> '' THEN ? ELSE turn_id END,
 			working_dir = CASE WHEN ? <> '' THEN ? ELSE working_dir END,
 			transcript_path = CASE WHEN ? <> '' THEN ? ELSE transcript_path END,
+			outcome = CASE WHEN ? <> 'unknown' THEN ? ELSE outcome END,
 			updated_at = ?
 		WHERE source = ? AND external_id = ?`,
 		session.TurnID, session.TurnID,
 		session.WorkingDir, session.WorkingDir,
 		session.TranscriptPath, session.TranscriptPath,
+		session.Outcome, session.Outcome,
 		unixNano(now), session.Source, session.ExternalID,
 	)
 	if err != nil {
@@ -214,6 +228,70 @@ func (s *Store) RecordSession(ctx context.Context, session domain.Session) (bool
 		return false, errors.New("store: session conflict could not be refreshed")
 	}
 	return false, nil
+}
+
+// PruneRetention removes only ephemeral operational state. Zero durations are
+// explicit opt-outs. Session rows and all durable learning/audit records remain.
+func (s *Store) PruneRetention(
+	ctx context.Context,
+	now time.Time,
+	transcriptLocators time.Duration,
+	completedJobs time.Duration,
+	failedJobs time.Duration,
+) (RetentionPruneResult, error) {
+	if now.IsZero() {
+		return RetentionPruneResult{}, errors.New("store: retention time is required")
+	}
+	if transcriptLocators < 0 || completedJobs < 0 || failedJobs < 0 {
+		return RetentionPruneResult{}, errors.New("store: retention durations cannot be negative")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return RetentionPruneResult{}, fmt.Errorf("store: begin retention prune: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	result := RetentionPruneResult{}
+	if transcriptLocators > 0 {
+		changed, err := tx.ExecContext(ctx, `
+			UPDATE sessions SET transcript_path = ''
+			WHERE transcript_path <> '' AND updated_at < ?`,
+			unixNano(now.Add(-transcriptLocators)),
+		)
+		if err != nil {
+			return RetentionPruneResult{}, fmt.Errorf("store: prune transcript locators: %w", err)
+		}
+		result.TranscriptLocators, err = affectedRows(changed)
+		if err != nil {
+			return RetentionPruneResult{}, err
+		}
+	}
+	for _, target := range []struct {
+		status    domain.JobStatus
+		retention time.Duration
+		count     *int
+	}{
+		{domain.JobCompleted, completedJobs, &result.CompletedJobs},
+		{domain.JobFailed, failedJobs, &result.FailedJobs},
+	} {
+		if target.retention == 0 {
+			continue
+		}
+		changed, err := tx.ExecContext(ctx, `DELETE FROM jobs WHERE status = ? AND updated_at < ?`,
+			target.status, unixNano(now.Add(-target.retention)),
+		)
+		if err != nil {
+			return RetentionPruneResult{}, fmt.Errorf("store: prune %s jobs: %w", target.status, err)
+		}
+		*target.count, err = affectedRows(changed)
+		if err != nil {
+			return RetentionPruneResult{}, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return RetentionPruneResult{}, fmt.Errorf("store: commit retention prune: %w", err)
+	}
+	return result, nil
 }
 
 func (s *Store) AddLearningCard(ctx context.Context, card domain.LearningCard) (bool, error) {
@@ -1445,6 +1523,14 @@ func rowsChanged(result sql.Result) (bool, error) {
 		return false, fmt.Errorf("store: read affected rows: %w", err)
 	}
 	return count > 0, nil
+}
+
+func affectedRows(result sql.Result) (int, error) {
+	count, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("store: read affected rows: %w", err)
+	}
+	return int(count), nil
 }
 
 func expectChanged(result sql.Result) error {

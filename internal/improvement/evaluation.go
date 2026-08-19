@@ -12,9 +12,9 @@ import (
 	"time"
 )
 
-// Evaluate rehydrates the exact baseline and candidate commits. A successful
-// evaluation proves the derived learning case regresses on baseline and passes
-// on candidate, independently of the user's current checkout.
+// Evaluate rehydrates the exact baseline and candidate commits. Structural
+// checks remain useful without a Runner, while promotion separately requires
+// an external baseline failure and candidate success from these exact commits.
 func (service Service) Evaluate(ctx context.Context, candidate Candidate) (Evaluation, error) {
 	evaluation := Evaluation{
 		SkillID:               candidate.SkillID,

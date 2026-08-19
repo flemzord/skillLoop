@@ -409,6 +409,9 @@ func (manager Manager) autopilot(ctx context.Context, proposal domain.Proposal, 
 }
 
 func (manager Manager) approve(ctx context.Context, proposal domain.Proposal, evaluation improvement.Evaluation, actor string) (domain.Promotion, error) {
+	if err := improvement.ValidatePromotionProof(evaluation); err != nil {
+		return domain.Promotion{}, fmt.Errorf("pipeline: promotion requires comparative proof: %w", err)
+	}
 	if !evaluation.Passed || proposal.CandidateScore-proposal.BaselineScore < manager.Config.Evaluation.MinimumImprovement {
 		return domain.Promotion{}, improvement.ErrEvaluationFailed
 	}
@@ -461,20 +464,32 @@ func (manager Manager) persistedEvaluation(ctx context.Context, proposal domain.
 	if baseline == nil || candidate == nil || baseline.Passed || !candidate.Passed {
 		return improvement.Evaluation{}, improvement.ErrEvaluationFailed
 	}
+	type persistedRun struct {
+		Revision  string `json:"revision"`
+		ExitCode  int    `json:"exit_code"`
+		Truncated bool   `json:"truncated"`
+		TimedOut  bool   `json:"timed_out"`
+	}
 	var metadata struct {
-		RequiresHumanApproval bool            `json:"requires_human_approval"`
-		BaselineRun           json.RawMessage `json:"baseline_run"`
-		CandidateRun          json.RawMessage `json:"candidate_run"`
+		RequiresHumanApproval bool          `json:"requires_human_approval"`
+		BaselineRun           *persistedRun `json:"baseline_run"`
+		CandidateRun          *persistedRun `json:"candidate_run"`
 	}
 	if err := json.Unmarshal([]byte(candidate.Details), &metadata); err != nil {
 		return improvement.Evaluation{}, fmt.Errorf("pipeline: decode persisted evaluation: %w", err)
 	}
 	var baselineRun, candidateRun *improvement.RunResult
-	if len(metadata.BaselineRun) > 0 && string(metadata.BaselineRun) != "null" {
-		baselineRun = &improvement.RunResult{}
+	if metadata.BaselineRun != nil {
+		baselineRun = &improvement.RunResult{
+			Revision: metadata.BaselineRun.Revision, ExitCode: metadata.BaselineRun.ExitCode,
+			Truncated: metadata.BaselineRun.Truncated, TimedOut: metadata.BaselineRun.TimedOut,
+		}
 	}
-	if len(metadata.CandidateRun) > 0 && string(metadata.CandidateRun) != "null" {
-		candidateRun = &improvement.RunResult{}
+	if metadata.CandidateRun != nil {
+		candidateRun = &improvement.RunResult{
+			Revision: metadata.CandidateRun.Revision, ExitCode: metadata.CandidateRun.ExitCode,
+			Truncated: metadata.CandidateRun.Truncated, TimedOut: metadata.CandidateRun.TimedOut,
+		}
 	}
 	return improvement.Evaluation{
 		SkillID: proposal.SkillID, ClusterID: proposal.ClusterID,
@@ -552,9 +567,10 @@ func runDuration(result *improvement.RunResult) time.Duration {
 
 func evaluationDetails(evaluation improvement.Evaluation) string {
 	type safeRun struct {
-		ExitCode  int  `json:"exit_code"`
-		Truncated bool `json:"truncated"`
-		TimedOut  bool `json:"timed_out"`
+		Revision  string `json:"revision"`
+		ExitCode  int    `json:"exit_code"`
+		Truncated bool   `json:"truncated"`
+		TimedOut  bool   `json:"timed_out"`
 	}
 	details := struct {
 		Checks                []improvement.Check `json:"checks"`
@@ -563,10 +579,10 @@ func evaluationDetails(evaluation improvement.Evaluation) string {
 		CandidateRun          *safeRun            `json:"candidate_run,omitempty"`
 	}{Checks: evaluation.Checks, RequiresHumanApproval: evaluation.RequiresHumanApproval}
 	if evaluation.BaselineRun != nil {
-		details.BaselineRun = &safeRun{ExitCode: evaluation.BaselineRun.ExitCode, Truncated: evaluation.BaselineRun.Truncated, TimedOut: evaluation.BaselineRun.TimedOut}
+		details.BaselineRun = &safeRun{Revision: evaluation.BaselineRun.Revision, ExitCode: evaluation.BaselineRun.ExitCode, Truncated: evaluation.BaselineRun.Truncated, TimedOut: evaluation.BaselineRun.TimedOut}
 	}
 	if evaluation.CandidateRun != nil {
-		details.CandidateRun = &safeRun{ExitCode: evaluation.CandidateRun.ExitCode, Truncated: evaluation.CandidateRun.Truncated, TimedOut: evaluation.CandidateRun.TimedOut}
+		details.CandidateRun = &safeRun{Revision: evaluation.CandidateRun.Revision, ExitCode: evaluation.CandidateRun.ExitCode, Truncated: evaluation.CandidateRun.Truncated, TimedOut: evaluation.CandidateRun.TimedOut}
 	}
 	encoded, _ := json.Marshal(details)
 	return string(encoded)

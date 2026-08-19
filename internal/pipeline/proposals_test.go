@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,7 +22,8 @@ import (
 
 func TestProcessEligibleDeduplicatesAndSupportsTwoPromotions(t *testing.T) {
 	ctx := context.Background()
-	manager, database, skill := newTestManager(t, domain.ModePropose, nil)
+	t.Setenv("SKILLLOOP_PIPELINE_RUNNER", "1")
+	manager, database, skill := newTestManager(t, domain.ModePropose, []string{os.Args[0], "-test.run=^TestPipelineRunnerHelper$"})
 	firstCluster := seedCluster(t, database, skill, "correction requires tests", "Run tests before reporting completion.", 1)
 
 	result, err := manager.ProcessEligible(ctx, []domain.Cluster{firstCluster})
@@ -47,8 +49,13 @@ func TestProcessEligibleDeduplicatesAndSupportsTwoPromotions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("approve first: %v", err)
 	}
+	idempotentPromotion, err := manager.Approve(ctx, proposals[0].ID, "tester")
+	if err != nil || idempotentPromotion.ID != firstPromotion.ID {
+		t.Fatalf("idempotent approval=%#v err=%v", idempotentPromotion, err)
+	}
 
 	secondCluster := seedCluster(t, database, skill, "artifact verification", "Inspect the generated artifact before completion.", 10)
+	t.Setenv("SKILLLOOP_PIPELINE_EXPECTED_MARKERS", "2")
 	result, err = manager.ProcessEligible(ctx, []domain.Cluster{secondCluster})
 	if err != nil || result.Created != 1 || result.Evaluated != 1 {
 		t.Fatalf("second process result = %#v err=%v", result, err)
@@ -168,6 +175,30 @@ func TestApprovePendingProposalFails(t *testing.T) {
 	}
 }
 
+func TestApproveRequiresPersistedExternalComparativeProof(t *testing.T) {
+	manager, database, skill := newTestManager(t, domain.ModePropose, nil)
+	cluster := seedCluster(t, database, skill, "structural only", "Validate the exact output first.", 1)
+	proposal, created, err := manager.Create(context.Background(), cluster.ID, "test")
+	if err != nil || !created {
+		t.Fatalf("create: created=%v err=%v", created, err)
+	}
+	proposal, evaluation, err := manager.Evaluate(context.Background(), proposal.ID, "test")
+	if err != nil || !evaluation.Passed || evaluation.BaselineRun != nil || evaluation.CandidateRun != nil {
+		t.Fatalf("structural evaluation=%#v err=%v", evaluation, err)
+	}
+	_, err = manager.Approve(context.Background(), proposal.ID, "human")
+	if !errors.Is(err, improvement.ErrExternalEvaluationRequired) {
+		t.Fatalf("approve error=%v, want ErrExternalEvaluationRequired", err)
+	}
+	if !strings.Contains(err.Error(), "promotion requires comparative proof") {
+		t.Fatalf("approve error is not explicit: %v", err)
+	}
+	stored, err := database.Proposal(context.Background(), proposal.ID)
+	if err != nil || stored.Status != domain.ProposalEvaluated {
+		t.Fatalf("proposal mutated after refused approval=%#v err=%v", stored, err)
+	}
+}
+
 func TestApproveRefusesObserveMode(t *testing.T) {
 	manager, database, skill := newTestManager(t, domain.ModePropose, nil)
 	cluster := seedCluster(t, database, skill, "observe approval", "Validate the output first.", 1)
@@ -262,7 +293,14 @@ func TestPipelineRunnerHelper(t *testing.T) {
 	if err != nil {
 		os.Exit(2)
 	}
-	if !strings.Contains(string(contents), "<!-- skillloop:begin ") {
+	expectedMarkers := 1
+	if raw := os.Getenv("SKILLLOOP_PIPELINE_EXPECTED_MARKERS"); raw != "" {
+		expectedMarkers, err = strconv.Atoi(raw)
+		if err != nil {
+			os.Exit(2)
+		}
+	}
+	if strings.Count(string(contents), "<!-- skillloop:begin ") < expectedMarkers {
 		os.Exit(1)
 	}
 }

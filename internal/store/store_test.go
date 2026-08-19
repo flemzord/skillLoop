@@ -47,6 +47,13 @@ func TestOpenConfiguresSQLiteAndConstraints(t *testing.T) {
 	if err == nil {
 		t.Fatal("foreign key violation unexpectedly succeeded")
 	}
+	_, err = store.db.ExecContext(ctx, `
+		INSERT INTO sessions (
+			reference, source, external_id, outcome, created_at, updated_at
+		) VALUES ('invalid-outcome', 'codex', 'invalid-outcome', 'partial', 1, 1)`)
+	if err == nil {
+		t.Fatal("invalid session outcome unexpectedly satisfied the SQLite constraint")
+	}
 
 	var version int
 	if err := store.db.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil {
@@ -114,6 +121,165 @@ func TestSessionAndLearningCardInsertsAreIdempotent(t *testing.T) {
 	}
 	if counts.Skills != 1 || counts.Sessions != 1 || counts.Cards != 1 {
 		t.Fatalf("counts = %#v, want one skill/session/card", counts)
+	}
+}
+
+func TestRecordSessionPersistsAndEnrichesOutcome(t *testing.T) {
+	database := openTestStore(t)
+	ctx := context.Background()
+	session := testSession("outcome")
+	session.Outcome = domain.SessionOutcomeUnknown
+	if created, err := database.RecordSession(ctx, session); err != nil || !created {
+		t.Fatalf("record unknown session: created=%v err=%v", created, err)
+	}
+	assertOutcome := func(want domain.SessionOutcome) {
+		t.Helper()
+		var got domain.SessionOutcome
+		if err := database.db.QueryRowContext(ctx, `SELECT outcome FROM sessions WHERE reference = ?`, session.Reference).Scan(&got); err != nil {
+			t.Fatalf("read outcome: %v", err)
+		}
+		if got != want {
+			t.Fatalf("outcome = %q, want %q", got, want)
+		}
+	}
+	assertOutcome(domain.SessionOutcomeUnknown)
+
+	session.Outcome = domain.SessionOutcomeFailed
+	if created, err := database.RecordSession(ctx, session); err != nil || created {
+		t.Fatalf("enrich session outcome: created=%v err=%v", created, err)
+	}
+	assertOutcome(domain.SessionOutcomeFailed)
+
+	session.Outcome = domain.SessionOutcomeUnknown
+	if created, err := database.RecordSession(ctx, session); err != nil || created {
+		t.Fatalf("replay unknown session outcome: created=%v err=%v", created, err)
+	}
+	assertOutcome(domain.SessionOutcomeFailed)
+
+	session.Outcome = domain.SessionOutcome("invalid")
+	if _, err := database.RecordSession(ctx, session); err == nil {
+		t.Fatal("expected invalid outcome error")
+	}
+}
+
+func TestPruneRetentionKeepsDurableLearningAndRecentOperationalData(t *testing.T) {
+	database := openTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
+	old := now.Add(-48 * time.Hour)
+	recent := now.Add(-time.Hour)
+
+	skill := testSkill("retention")
+	mustRegisterSkill(t, database, skill)
+	database.now = func() time.Time { return old }
+	oldSession := testSession("old-retention")
+	mustRecordSession(t, database, oldSession)
+	mustAddCard(t, database, testCard("durable-card", oldSession.Reference, skill.ID, "durable"))
+	completedOld := enqueueTerminalJob(t, database, "completed-old", false)
+	failedOld := enqueueTerminalJob(t, database, "failed-old", true)
+
+	database.now = func() time.Time { return recent }
+	recentSession := testSession("recent-retention")
+	mustRecordSession(t, database, recentSession)
+	completedRecent := enqueueTerminalJob(t, database, "completed-recent", false)
+
+	pruned, err := database.PruneRetention(ctx, now, 24*time.Hour, 24*time.Hour, 24*time.Hour)
+	if err != nil {
+		t.Fatalf("prune retention: %v", err)
+	}
+	if pruned != (RetentionPruneResult{TranscriptLocators: 1, CompletedJobs: 1, FailedJobs: 1}) {
+		t.Fatalf("pruned = %#v", pruned)
+	}
+	var oldPath, recentPath string
+	if err := database.db.QueryRowContext(ctx, `SELECT transcript_path FROM sessions WHERE reference = ?`, oldSession.Reference).Scan(&oldPath); err != nil {
+		t.Fatalf("read old locator: %v", err)
+	}
+	if err := database.db.QueryRowContext(ctx, `SELECT transcript_path FROM sessions WHERE reference = ?`, recentSession.Reference).Scan(&recentPath); err != nil {
+		t.Fatalf("read recent locator: %v", err)
+	}
+	if oldPath != "" || recentPath != recentSession.TranscriptPath {
+		t.Fatalf("locators old=%q recent=%q", oldPath, recentPath)
+	}
+	for _, id := range []string{completedOld, failedOld} {
+		var count int
+		if err := database.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM jobs WHERE id = ?`, id).Scan(&count); err != nil || count != 0 {
+			t.Fatalf("old job %s count=%d err=%v", id, count, err)
+		}
+	}
+	var recentCount int
+	if err := database.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM jobs WHERE id = ?`, completedRecent).Scan(&recentCount); err != nil || recentCount != 1 {
+		t.Fatalf("recent job count=%d err=%v", recentCount, err)
+	}
+	cards, err := database.ListLearningCards(ctx, skill.ID)
+	if err != nil || len(cards) != 1 || cards[0].ID != "durable-card" {
+		t.Fatalf("durable cards=%#v err=%v", cards, err)
+	}
+}
+
+func TestPruneRetentionZeroKeepsOperationalDataIndefinitely(t *testing.T) {
+	database := openTestStore(t)
+	ctx := context.Background()
+	old := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	database.now = func() time.Time { return old }
+	session := testSession("indefinite-retention")
+	mustRecordSession(t, database, session)
+	jobID := enqueueTerminalJob(t, database, "indefinite-job", false)
+
+	pruned, err := database.PruneRetention(ctx, old.Add(10*365*24*time.Hour), 0, 0, 0)
+	if err != nil {
+		t.Fatalf("prune indefinite retention: %v", err)
+	}
+	if pruned != (RetentionPruneResult{}) {
+		t.Fatalf("pruned = %#v, want zero", pruned)
+	}
+	var path string
+	if err := database.db.QueryRowContext(ctx, `SELECT transcript_path FROM sessions WHERE reference = ?`, session.Reference).Scan(&path); err != nil || path != session.TranscriptPath {
+		t.Fatalf("locator=%q err=%v", path, err)
+	}
+	var jobCount int
+	if err := database.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM jobs WHERE id = ?`, jobID).Scan(&jobCount); err != nil || jobCount != 1 {
+		t.Fatalf("job count=%d err=%v", jobCount, err)
+	}
+}
+
+func TestRegisterSkillScopesInstructionPathToRepository(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+
+	first := domain.Skill{
+		ID:              "skill-first",
+		Name:            "First",
+		RepositoryPath:  "/tmp/skills/first",
+		InstructionPath: "SKILL.md",
+		Enabled:         true,
+	}
+	second := domain.Skill{
+		ID:              "skill-second",
+		Name:            "Second",
+		RepositoryPath:  "/tmp/skills/second",
+		InstructionPath: "SKILL.md",
+		Enabled:         true,
+	}
+	for _, skill := range []domain.Skill{first, second} {
+		created, err := store.RegisterSkill(ctx, skill)
+		if err != nil || !created {
+			t.Fatalf("register %s: created=%v err=%v", skill.ID, created, err)
+		}
+	}
+
+	duplicateIdentity := first
+	duplicateIdentity.ID = "skill-first-duplicate"
+	duplicateIdentity.Name = "First duplicate"
+	if created, err := store.RegisterSkill(ctx, duplicateIdentity); err == nil || created {
+		t.Fatalf("register duplicate repository/instruction identity: created=%v err=%v", created, err)
+	}
+
+	skills, err := store.ListSkills(ctx)
+	if err != nil {
+		t.Fatalf("list skills: %v", err)
+	}
+	if len(skills) != 2 {
+		t.Fatalf("skills = %#v, want the two distinct repositories", skills)
 	}
 }
 
@@ -456,6 +622,26 @@ func mustAddCard(t *testing.T, store *Store, card domain.LearningCard) {
 	if err != nil || !created {
 		t.Fatalf("add card: created=%v err=%v", created, err)
 	}
+}
+
+func enqueueTerminalJob(t *testing.T, database *Store, id string, failed bool) string {
+	t.Helper()
+	ctx := context.Background()
+	job := domain.Job{ID: id, Kind: "test", IdempotencyKey: "test:" + id, Payload: id}
+	if created, err := database.EnqueueJob(ctx, job); err != nil || !created {
+		t.Fatalf("enqueue job %s: created=%v err=%v", id, created, err)
+	}
+	if _, claimed, err := database.ClaimJob(ctx, id, time.Minute); err != nil || !claimed {
+		t.Fatalf("claim job %s: claimed=%v err=%v", id, claimed, err)
+	}
+	if failed {
+		if err := database.RetryJob(ctx, id, "terminal failure", database.now(), true); err != nil {
+			t.Fatalf("fail job %s: %v", id, err)
+		}
+	} else if err := database.CompleteJob(ctx, id); err != nil {
+		t.Fatalf("complete job %s: %v", id, err)
+	}
+	return id
 }
 
 func seedEligibleCluster(t *testing.T, store *Store) (domain.Skill, domain.Cluster) {

@@ -44,8 +44,32 @@ func (Normalizer) Normalize(ctx context.Context, event domain.HookEvent) (domain
 		TurnID:         event.TurnID,
 		WorkingDir:     event.WorkingDir,
 		TranscriptPath: event.TranscriptPath,
+		Outcome:        sessionOutcome(messages),
 		Messages:       messages,
 	}, nil
+}
+
+func sessionOutcome(messages []domain.Message) domain.SessionOutcome {
+	knownCalls := make(map[string]struct{})
+	outcome := domain.SessionOutcomeUnknown
+	for _, message := range messages {
+		if message.ToolCallID == "" {
+			continue
+		}
+		if !message.ToolResult {
+			knownCalls[message.ToolCallID] = struct{}{}
+			continue
+		}
+		if _, correlated := knownCalls[message.ToolCallID]; !correlated {
+			continue
+		}
+		if message.Failed {
+			outcome = domain.SessionOutcomeFailed
+		} else {
+			outcome = domain.SessionOutcomeSucceeded
+		}
+	}
+	return outcome
 }
 
 func normalizeReader(ctx context.Context, source domain.Source, reader io.Reader) ([]domain.Message, error) {

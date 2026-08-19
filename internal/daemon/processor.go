@@ -34,19 +34,23 @@ type Processor struct {
 }
 
 type DrainResult struct {
-	Captured             int
-	Processed            int
-	Excluded             int
-	Failed               int
-	CardsCreated         int
-	EligibleClusters     []domain.Cluster
-	ProposalsCreated     int
-	ProposalsEvaluated   int
-	ProposalsPromoted    int
-	ProposalFailures     int
-	PromotionsMonitored  int
-	PromotionsRolledBack int
-	MonitorFailures      int
+	Captured                 int
+	Processed                int
+	Excluded                 int
+	Failed                   int
+	CardsCreated             int
+	EligibleClusters         []domain.Cluster
+	ProposalsCreated         int
+	ProposalsEvaluated       int
+	ProposalsPromoted        int
+	ProposalFailures         int
+	PromotionsMonitored      int
+	PromotionsRolledBack     int
+	MonitorFailures          int
+	PrunedTranscriptLocators int
+	PrunedCompletedJobs      int
+	PrunedFailedJobs         int
+	PrunedFailedSpool        int
 }
 
 func (processor Processor) Drain(ctx context.Context, limit int) (DrainResult, error) {
@@ -64,16 +68,36 @@ func (processor Processor) Drain(ctx context.Context, limit int) (DrainResult, e
 	if err != nil {
 		return DrainResult{}, err
 	}
-	if err := recoverProcessing(directories); err != nil {
+	now := processor.Now().UTC()
+	retentionResult, err := processor.Store.PruneRetention(
+		ctx,
+		now,
+		processor.Config.Retention.TranscriptLocators,
+		processor.Config.Retention.CompletedJobs,
+		processor.Config.Retention.FailedJobs,
+	)
+	if err != nil {
+		return DrainResult{}, fmt.Errorf("daemon: prune retained metadata: %w", err)
+	}
+	prunedFailedSpool, err := pruneFailedSpool(ctx, directories.failed, now, processor.Config.Retention.FailedSpool)
+	if err != nil {
 		return DrainResult{}, err
+	}
+	result := DrainResult{
+		PrunedTranscriptLocators: retentionResult.TranscriptLocators,
+		PrunedCompletedJobs:      retentionResult.CompletedJobs,
+		PrunedFailedJobs:         retentionResult.FailedJobs,
+		PrunedFailedSpool:        prunedFailedSpool,
+	}
+	if err := recoverProcessing(directories); err != nil {
+		return result, err
 	}
 	entries, err := os.ReadDir(directories.incoming)
 	if err != nil {
-		return DrainResult{}, fmt.Errorf("daemon: read incoming spool: %w", err)
+		return result, fmt.Errorf("daemon: read incoming spool: %w", err)
 	}
 	sort.Slice(entries, func(left, right int) bool { return entries[left].Name() < entries[right].Name() })
 
-	result := DrainResult{}
 	for _, entry := range entries {
 		if result.Captured >= limit {
 			break
@@ -119,6 +143,47 @@ func (processor Processor) Drain(ctx context.Context, limit int) (DrainResult, e
 		result.MonitorFailures = len(monitorResult.Failures)
 	}
 	return result, nil
+}
+
+func pruneFailedSpool(ctx context.Context, directory string, now time.Time, retention time.Duration) (int, error) {
+	if retention < 0 {
+		return 0, errors.New("daemon: failed spool retention cannot be negative")
+	}
+	if retention == 0 {
+		return 0, nil
+	}
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		return 0, fmt.Errorf("daemon: inspect failed spool: %w", err)
+	}
+	cutoff := now.Add(-retention)
+	pruned := 0
+	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return pruned, err
+		}
+		if filepath.Ext(entry.Name()) != ".json" || entry.Type()&os.ModeSymlink != 0 {
+			continue
+		}
+		path := filepath.Join(directory, entry.Name())
+		info, err := os.Lstat(path)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return pruned, fmt.Errorf("daemon: inspect failed spool entry: %w", err)
+		}
+		if !info.Mode().IsRegular() || !info.ModTime().Before(cutoff) {
+			continue
+		}
+		if err := os.Remove(path); errors.Is(err, os.ErrNotExist) {
+			continue
+		} else if err != nil {
+			return pruned, fmt.Errorf("daemon: prune failed spool entry: %w", err)
+		}
+		pruned++
+	}
+	return pruned, nil
 }
 
 func (processor Processor) processFile(ctx context.Context, directories spoolDirectories, name string) (DrainResult, error) {

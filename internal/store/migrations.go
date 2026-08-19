@@ -12,9 +12,10 @@ CREATE TABLE skills (
 	id TEXT PRIMARY KEY CHECK (length(id) > 0),
 	name TEXT NOT NULL CHECK (length(name) > 0),
 	repository_path TEXT NOT NULL CHECK (length(repository_path) > 0),
-	instruction_path TEXT NOT NULL UNIQUE CHECK (length(instruction_path) > 0),
+	instruction_path TEXT NOT NULL CHECK (length(instruction_path) > 0),
 	enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
-	created_at INTEGER NOT NULL
+	created_at INTEGER NOT NULL,
+	UNIQUE(repository_path, instruction_path)
 );
 
 CREATE TABLE sessions (
@@ -24,6 +25,7 @@ CREATE TABLE sessions (
 	turn_id TEXT NOT NULL DEFAULT '',
 	working_dir TEXT NOT NULL DEFAULT '',
 	transcript_path TEXT NOT NULL DEFAULT '',
+	outcome TEXT NOT NULL DEFAULT 'unknown' CHECK (outcome IN ('unknown', 'succeeded', 'failed')),
 	created_at INTEGER NOT NULL,
 	updated_at INTEGER NOT NULL,
 	UNIQUE(source, external_id)

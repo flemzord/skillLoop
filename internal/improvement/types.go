@@ -5,6 +5,7 @@ package improvement
 
 import (
 	"errors"
+	"fmt"
 	"time"
 )
 
@@ -14,16 +15,18 @@ const (
 )
 
 var (
-	ErrUnsafePath       = errors.New("unsafe skill path")
-	ErrUnsafeChange     = errors.New("security-sensitive skill change")
-	ErrDiffLimit        = errors.New("candidate diff exceeds limits")
-	ErrDrift            = errors.New("git revision drift")
-	ErrEvaluationFailed = errors.New("candidate did not pass evaluation")
-	ErrNoRelease        = errors.New("skill has no current release")
+	ErrUnsafePath                 = errors.New("unsafe skill path")
+	ErrUnsafeChange               = errors.New("security-sensitive skill change")
+	ErrDiffLimit                  = errors.New("candidate diff exceeds limits")
+	ErrDrift                      = errors.New("git revision drift")
+	ErrEvaluationFailed           = errors.New("candidate did not pass evaluation")
+	ErrExternalEvaluationRequired = errors.New("external baseline/candidate evaluation is required for promotion")
+	ErrNoRelease                  = errors.New("skill has no current release")
 )
 
 // Service is safe for concurrent use. StateDir contains disposable worktrees
-// and immutable releases. Runner is optional.
+// and immutable releases. Runner is optional for inspection, but promotion
+// requires its exact baseline/candidate results.
 type Service struct {
 	StateDir string
 	Runner   Runner
@@ -80,6 +83,37 @@ type Evaluation struct {
 	RequiresHumanApproval bool
 	Passed                bool
 	EvaluatedAt           time.Time
+}
+
+// ValidateExternalRunPair verifies that an external evaluator completed
+// against the exact baseline and candidate revisions. It deliberately does not
+// judge the exit codes so monitoring can distinguish a completed regression
+// from missing or inconclusive evaluator infrastructure.
+func ValidateExternalRunPair(evaluation Evaluation) error {
+	if evaluation.BaselineRun == nil || evaluation.CandidateRun == nil ||
+		evaluation.BaselineRun.Revision == "" || evaluation.CandidateRun.Revision == "" {
+		return ErrExternalEvaluationRequired
+	}
+	if evaluation.BaselineRun.Revision != evaluation.BaseCommit || evaluation.CandidateRun.Revision != evaluation.CandidateCommit {
+		return fmt.Errorf("external evaluation revisions do not match candidate: %w", ErrDrift)
+	}
+	if evaluation.BaselineRun.TimedOut || evaluation.CandidateRun.TimedOut {
+		return fmt.Errorf("external baseline/candidate evaluation did not complete: %w", ErrEvaluationFailed)
+	}
+	return nil
+}
+
+// ValidatePromotionProof requires a completed comparative evaluation in which
+// the baseline fails and the candidate passes. Structural checks alone are
+// useful for inspection, but are never sufficient to promote a skill.
+func ValidatePromotionProof(evaluation Evaluation) error {
+	if err := ValidateExternalRunPair(evaluation); err != nil {
+		return err
+	}
+	if evaluation.BaselineRun.ExitCode == 0 || evaluation.CandidateRun.ExitCode != 0 {
+		return fmt.Errorf("external evaluator must fail the baseline and pass the candidate: %w", ErrEvaluationFailed)
+	}
+	return nil
 }
 
 // Approval is the human or policy decision handed to Promote. Both revisions

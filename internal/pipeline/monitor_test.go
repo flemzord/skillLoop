@@ -97,6 +97,30 @@ func TestMonitorEvaluatorInfrastructureFailureDoesNotRollback(t *testing.T) {
 	}
 }
 
+func TestMonitorWithoutExternalEvaluatorDoesNotMarkPromotionHealthy(t *testing.T) {
+	manager, promotion, _, skill := newPromotedMonitorFixture(t)
+	manager.Improver.Runner.Argv = nil
+
+	result, err := manager.Monitor(context.Background())
+	if err != nil {
+		t.Fatalf("monitor: %v", err)
+	}
+	if result.Checked != 1 || result.Healthy != 0 || result.Regressing != 0 || result.RolledBack != 0 || len(result.Failures) != 1 {
+		t.Fatalf("monitor result = %#v", result)
+	}
+	if !strings.Contains(result.Failures[0].Error, "external baseline/candidate evaluation is required") {
+		t.Fatalf("monitor failure is not explicit: %q", result.Failures[0].Error)
+	}
+
+	active, err := manager.Store.ActivePromotion(context.Background(), skill.ID)
+	if err != nil {
+		t.Fatalf("active promotion: %v", err)
+	}
+	if active.ID != promotion.ID || !active.Active || active.MonitorStatus != domain.MonitorPending {
+		t.Fatalf("promotion changed without external evaluator = %#v", active)
+	}
+}
+
 func TestMonitorExternalEvaluatorHelper(t *testing.T) {
 	if os.Getenv("SKILLLOOP_MONITOR_HELPER") != "1" {
 		return

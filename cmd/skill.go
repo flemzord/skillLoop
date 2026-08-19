@@ -104,6 +104,10 @@ func validateSkillRepository(ctx context.Context, repository, instruction string
 		return "", "", fmt.Errorf("resolve repository: %w", err)
 	}
 	absolute = filepath.Clean(absolute)
+	absolute, err = filepath.EvalSymlinks(absolute)
+	if err != nil {
+		return "", "", fmt.Errorf("resolve repository symlinks: %w", err)
+	}
 	relative := filepath.Clean(instruction)
 	if relative == "." || filepath.IsAbs(relative) || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
 		return "", "", errors.New("instruction file must stay inside the repository")

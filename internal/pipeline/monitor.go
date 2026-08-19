@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/flemzord/skillloop/internal/domain"
+	"github.com/flemzord/skillloop/internal/improvement"
 )
 
 const monitorRegressionReason = "evaluation regression"
@@ -50,6 +51,10 @@ func (manager Manager) Monitor(ctx context.Context) (MonitorResult, error) {
 		}
 		evaluation, err := manager.Improver.Evaluate(ctx, candidate)
 		if err != nil {
+			result.addFailure(promotion, err)
+			continue
+		}
+		if err := improvement.ValidateExternalRunPair(evaluation); err != nil {
 			result.addFailure(promotion, err)
 			continue
 		}

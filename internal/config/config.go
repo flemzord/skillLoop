@@ -21,6 +21,7 @@ type Config struct {
 	PollInterval  time.Duration       `yaml:"poll_interval"`
 	Aggregation   Aggregation         `yaml:"aggregation"`
 	Evaluation    Evaluation          `yaml:"evaluation"`
+	Retention     Retention           `yaml:"retention"`
 	ExcludedPaths []string            `yaml:"excluded_paths,omitempty"`
 }
 
@@ -32,6 +33,32 @@ type Evaluation struct {
 	Command            []string `yaml:"command,omitempty"`
 	MinimumImprovement float64  `yaml:"minimum_improvement"`
 	AllowAutopilot     bool     `yaml:"allow_autopilot"`
+}
+
+// Retention controls cleanup of ephemeral operational data. A zero duration
+// explicitly means that the corresponding data is retained indefinitely.
+// Learning cards, clusters, proposals, releases, and audit entries are durable
+// learning state and are never covered by these settings.
+type Retention struct {
+	TranscriptLocators time.Duration `yaml:"transcript_locators"`
+	FailedSpool        time.Duration `yaml:"failed_spool"`
+	CompletedJobs      time.Duration `yaml:"completed_jobs"`
+	FailedJobs         time.Duration `yaml:"failed_jobs"`
+}
+
+func defaultRetention() Retention {
+	return Retention{
+		TranscriptLocators: 30 * 24 * time.Hour,
+		FailedSpool:        7 * 24 * time.Hour,
+		CompletedJobs:      7 * 24 * time.Hour,
+		FailedJobs:         30 * 24 * time.Hour,
+	}
+}
+
+func (retention *Retention) UnmarshalYAML(node *yaml.Node) error {
+	type plainRetention Retention
+	*retention = defaultRetention()
+	return node.Decode((*plainRetention)(retention))
 }
 
 func Default() (Config, error) {
@@ -46,6 +73,7 @@ func Default() (Config, error) {
 		PollInterval: 5 * time.Second,
 		Aggregation:  Aggregation{MinimumSessions: 3},
 		Evaluation:   Evaluation{MinimumImprovement: 0.1},
+		Retention:    defaultRetention(),
 	}, nil
 }
 
@@ -69,7 +97,7 @@ func Load(path string) (Config, error) {
 	if err != nil {
 		return Config{}, fmt.Errorf("read config %s: %w", path, err)
 	}
-	config := Config{}
+	config := Config{Retention: defaultRetention()}
 	if err := yaml.Unmarshal(contents, &config); err != nil {
 		return Config{}, fmt.Errorf("decode config %s: %w", path, err)
 	}
@@ -97,6 +125,18 @@ func (config Config) Validate() error {
 	}
 	if config.Evaluation.MinimumImprovement < 0 {
 		return errors.New("evaluation.minimum_improvement cannot be negative")
+	}
+	if config.Retention.TranscriptLocators < 0 {
+		return errors.New("retention.transcript_locators cannot be negative (zero retains indefinitely)")
+	}
+	if config.Retention.FailedSpool < 0 {
+		return errors.New("retention.failed_spool cannot be negative (zero retains indefinitely)")
+	}
+	if config.Retention.CompletedJobs < 0 {
+		return errors.New("retention.completed_jobs cannot be negative (zero retains indefinitely)")
+	}
+	if config.Retention.FailedJobs < 0 {
+		return errors.New("retention.failed_jobs cannot be negative (zero retains indefinitely)")
 	}
 	if config.Mode == domain.ModeAutopilot && (!config.Evaluation.AllowAutopilot || len(config.Evaluation.Command) == 0) {
 		return errors.New("autopilot requires allow_autopilot and an external evaluation command")

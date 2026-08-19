@@ -28,9 +28,6 @@ func (service Service) Promote(ctx context.Context, skill domain.Skill, candidat
 	if approval.BaseCommit != candidate.BaseCommit || approval.CandidateCommit != candidate.CandidateCommit {
 		return Promotion{}, fmt.Errorf("approval revisions do not match candidate: %w", ErrDrift)
 	}
-	if !evaluation.Passed {
-		return Promotion{}, ErrEvaluationFailed
-	}
 	if evaluation.SkillID != candidate.SkillID || evaluation.ClusterID != candidate.ClusterID ||
 		evaluation.BaseCommit != candidate.BaseCommit || evaluation.CandidateCommit != candidate.CandidateCommit {
 		return Promotion{}, fmt.Errorf("evaluation revisions do not match candidate: %w", ErrDrift)
@@ -73,22 +70,28 @@ func (service Service) Promote(ctx context.Context, skill domain.Skill, candidat
 		return Promotion{}, currentErr
 	}
 	previousCommit := candidate.BaseCommit
-	if currentErr == nil {
-		if current.Commit == candidate.CandidateCommit {
-			root, rootErr := service.skillReleaseRoot(skill.ID)
-			if rootErr != nil {
-				return Promotion{}, rootErr
-			}
-			previous, _, previousErr := readReleaseLink(root, "previous")
-			if previousErr != nil || previous != candidate.BaseCommit {
-				return Promotion{}, fmt.Errorf("already promoted release has mismatched previous revision: %w", ErrDrift)
-			}
-			return Promotion{
-				SkillID: skill.ID, CurrentCommit: candidate.CandidateCommit,
-				PreviousCommit: candidate.BaseCommit, ReleasePath: current.Path,
-				CurrentLink: filepath.Join(root, "current"), PromotedAt: time.Now().UTC(),
-			}, nil
+	if currentErr == nil && current.Commit == candidate.CandidateCommit {
+		root, rootErr := service.skillReleaseRoot(skill.ID)
+		if rootErr != nil {
+			return Promotion{}, rootErr
 		}
+		previous, _, previousErr := readReleaseLink(root, "previous")
+		if previousErr != nil || previous != candidate.BaseCommit {
+			return Promotion{}, fmt.Errorf("already promoted release has mismatched previous revision: %w", ErrDrift)
+		}
+		return Promotion{
+			SkillID: skill.ID, CurrentCommit: candidate.CandidateCommit,
+			PreviousCommit: candidate.BaseCommit, ReleasePath: current.Path,
+			CurrentLink: filepath.Join(root, "current"), PromotedAt: time.Now().UTC(),
+		}, nil
+	}
+	if err := ValidatePromotionProof(evaluation); err != nil {
+		return Promotion{}, err
+	}
+	if !evaluation.Passed {
+		return Promotion{}, ErrEvaluationFailed
+	}
+	if currentErr == nil {
 		branch, branchErr := git(ctx, repository, "rev-parse", "refs/heads/"+candidate.Branch)
 		if branchErr != nil || branch != candidate.CandidateCommit {
 			return Promotion{}, fmt.Errorf("candidate branch moved: %w", ErrDrift)
