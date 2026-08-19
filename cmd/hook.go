@@ -6,10 +6,11 @@ import (
 	"io"
 	"os"
 
+	"github.com/spf13/cobra"
+
 	"github.com/flemzord/skillloop/internal/capture"
 	"github.com/flemzord/skillloop/internal/config"
 	"github.com/flemzord/skillloop/internal/hooks"
-	"github.com/spf13/cobra"
 )
 
 func newHookCommand(options *rootOptions) *cobra.Command {

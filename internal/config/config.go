@@ -7,8 +7,9 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/flemzord/skillloop/internal/domain"
 	"gopkg.in/yaml.v3"
+
+	"github.com/flemzord/skillloop/internal/domain"
 )
 
 const fileName = "config.yaml"
@@ -147,6 +148,58 @@ func WriteInitial(path string, config Config) (string, error) {
 		return "", fmt.Errorf("sync config %s: %w", path, err)
 	}
 	remove = false
+	return path, nil
+}
+
+// Save atomically replaces an existing SkillLoop configuration.
+func Save(path string, config Config) (string, error) {
+	if path == "" {
+		var err error
+		path, err = DefaultPath()
+		if err != nil {
+			return "", err
+		}
+	}
+	if err := config.Validate(); err != nil {
+		return "", fmt.Errorf("validate config: %w", err)
+	}
+	contents, err := Encode(config)
+	if err != nil {
+		return "", err
+	}
+	parent := filepath.Dir(path)
+	if err := os.MkdirAll(parent, 0o700); err != nil {
+		return "", fmt.Errorf("create config directory: %w", err)
+	}
+	temporary, err := os.CreateTemp(parent, ".skillloop-config-*.tmp")
+	if err != nil {
+		return "", fmt.Errorf("create config temporary file: %w", err)
+	}
+	temporaryPath := temporary.Name()
+	cleanup := func() {
+		_ = temporary.Close()
+		_ = os.Remove(temporaryPath)
+	}
+	if err := temporary.Chmod(0o600); err != nil {
+		cleanup()
+		return "", fmt.Errorf("set config permissions: %w", err)
+	}
+	if _, err := temporary.Write(contents); err != nil {
+		cleanup()
+		return "", fmt.Errorf("write config: %w", err)
+	}
+	if err := temporary.Sync(); err != nil {
+		cleanup()
+		return "", fmt.Errorf("sync config: %w", err)
+	}
+	if err := temporary.Close(); err != nil {
+		cleanup()
+		return "", fmt.Errorf("close config: %w", err)
+	}
+	if err := os.Rename(temporaryPath, path); err != nil {
+		cleanup()
+		return "", fmt.Errorf("publish config %s: %w", path, err)
+	}
 	return path, nil
 }
 

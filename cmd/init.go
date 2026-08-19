@@ -4,10 +4,11 @@ import (
 	"fmt"
 	"path/filepath"
 
+	"github.com/spf13/cobra"
+
 	"github.com/flemzord/skillloop/internal/config"
 	"github.com/flemzord/skillloop/internal/domain"
 	"github.com/flemzord/skillloop/internal/store"
-	"github.com/spf13/cobra"
 )
 
 func newInitCommand(options *rootOptions) *cobra.Command {
@@ -56,6 +57,27 @@ func newModeCommand(options *rootOptions) *cobra.Command {
 				return err
 			}
 			_, err = fmt.Fprintln(command.OutOrStdout(), settings.Mode)
+			return err
+		},
+	})
+	command.AddCommand(&cobra.Command{
+		Use:   "set <observe|propose|autopilot>",
+		Short: "Change the configured autonomy mode",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(command *cobra.Command, args []string) error {
+			settings, err := config.Load(options.configPath)
+			if err != nil {
+				return err
+			}
+			settings.Mode = domain.AutonomyMode(args[0])
+			if !settings.Mode.Valid() {
+				return fmt.Errorf("invalid mode %q", args[0])
+			}
+			path, err := config.Save(options.configPath, settings)
+			if err != nil {
+				return err
+			}
+			_, err = fmt.Fprintf(command.OutOrStdout(), "Mode set to %s in %s\n", settings.Mode, path)
 			return err
 		},
 	})

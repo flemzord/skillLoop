@@ -13,13 +13,17 @@ import (
 	"strings"
 	"time"
 
-	"github.com/flemzord/skillloop/internal/domain"
 	"github.com/spf13/cobra"
+
+	"github.com/flemzord/skillloop/internal/domain"
 )
 
 func newSkillCommand(options *rootOptions) *cobra.Command {
 	command := &cobra.Command{Use: "skill", Short: "Manage owned and versioned skills"}
-	command.AddCommand(newSkillAddCommand(options), newSkillListCommand(options))
+	command.AddCommand(
+		newSkillAddCommand(options), newSkillListCommand(options),
+		newSkillInstallCommand(options), newSkillUninstallCommand(options),
+	)
 	return command
 }
 

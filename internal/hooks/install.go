@@ -17,6 +17,7 @@ import (
 type Installer struct {
 	HomeDir    string
 	Executable string
+	ConfigPath string
 }
 
 func (installer Installer) Install(source domain.Source) (bool, error) {
@@ -111,29 +112,50 @@ func (installer Installer) handler(source domain.Source, event Event) (json.RawM
 	if _, err := upstreamEventName(event); err != nil {
 		return nil, err
 	}
+	configPath := ""
+	if installer.ConfigPath != "" {
+		absolute, err := filepath.Abs(installer.ConfigPath)
+		if err != nil {
+			return nil, fmt.Errorf("resolve config path: %w", err)
+		}
+		configPath = absolute
+	}
 	var handler map[string]any
 	switch source {
 	case domain.SourceCodex:
-		command := shellQuote(installer.Executable) + " hook --provider " + string(source) + " --event " + string(event)
+		command := shellQuote(installer.Executable)
+		if configPath != "" {
+			command += " --config " + shellQuote(configPath)
+		}
+		command += " hook --provider " + string(source) + " --event " + string(event)
 		handler = map[string]any{
 			"type":    "command",
 			"command": command,
 			"timeout": 1,
 		}
 		if runtime.GOOS == "windows" {
-			handler["commandWindows"] = powershellQuote(installer.Executable) + " hook --provider " + string(source) + " --event " + string(event)
+			windowsCommand := powershellQuote(installer.Executable)
+			if configPath != "" {
+				windowsCommand += " --config " + powershellArgument(configPath)
+			}
+			handler["commandWindows"] = windowsCommand + " hook --provider " + string(source) + " --event " + string(event)
 		}
 	case domain.SourceClaude:
+		args := make([]string, 0, 7)
+		if configPath != "" {
+			args = append(args, "--config", configPath)
+		}
+		args = append(args,
+			"hook",
+			"--provider",
+			string(source),
+			"--event",
+			string(event),
+		)
 		handler = map[string]any{
 			"type":    "command",
 			"command": installer.Executable,
-			"args": []string{
-				"hook",
-				"--provider",
-				string(source),
-				"--event",
-				string(event),
-			},
+			"args":    args,
 			"timeout": 1,
 		}
 	default:
@@ -356,4 +378,8 @@ func shellQuote(value string) string {
 
 func powershellQuote(value string) string {
 	return "& '" + strings.ReplaceAll(value, "'", "''") + "'"
+}
+
+func powershellArgument(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
 }

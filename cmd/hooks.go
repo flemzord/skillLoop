@@ -5,28 +5,29 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/spf13/cobra"
+
 	"github.com/flemzord/skillloop/internal/domain"
 	"github.com/flemzord/skillloop/internal/hooks"
-	"github.com/spf13/cobra"
 )
 
-func newHooksCommand() *cobra.Command {
+func newHooksCommand(options *rootOptions) *cobra.Command {
 	command := &cobra.Command{
 		Use:   "hooks",
 		Short: "Manage user-scoped Codex and Claude hooks",
 	}
-	command.AddCommand(newHooksInstallCommand(), newHooksUninstallCommand())
+	command.AddCommand(newHooksInstallCommand(options), newHooksUninstallCommand(options))
 	return command
 }
 
-func newHooksInstallCommand() *cobra.Command {
+func newHooksInstallCommand(options *rootOptions) *cobra.Command {
 	return &cobra.Command{
 		Use:          "install [codex|claude]",
 		Short:        "Install SkillLoop capture hooks",
 		Args:         cobra.MaximumNArgs(1),
 		SilenceUsage: true,
 		RunE: func(_ *cobra.Command, args []string) error {
-			installer, err := currentInstaller()
+			installer, err := currentInstaller(options.configPath)
 			if err != nil {
 				return err
 			}
@@ -44,14 +45,14 @@ func newHooksInstallCommand() *cobra.Command {
 	}
 }
 
-func newHooksUninstallCommand() *cobra.Command {
+func newHooksUninstallCommand(options *rootOptions) *cobra.Command {
 	return &cobra.Command{
 		Use:          "uninstall [codex|claude]",
 		Short:        "Remove SkillLoop capture hooks",
 		Args:         cobra.MaximumNArgs(1),
 		SilenceUsage: true,
 		RunE: func(_ *cobra.Command, args []string) error {
-			installer, err := currentInstaller()
+			installer, err := currentInstaller(options.configPath)
 			if err != nil {
 				return err
 			}
@@ -69,7 +70,7 @@ func newHooksUninstallCommand() *cobra.Command {
 	}
 }
 
-func currentInstaller() (hooks.Installer, error) {
+func currentInstaller(configPath string) (hooks.Installer, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return hooks.Installer{}, fmt.Errorf("resolve home directory: %w", err)
@@ -82,7 +83,13 @@ func currentInstaller() (hooks.Installer, error) {
 	if err != nil {
 		return hooks.Installer{}, fmt.Errorf("make SkillLoop executable path absolute: %w", err)
 	}
-	return hooks.Installer{HomeDir: home, Executable: executable}, nil
+	if configPath != "" {
+		configPath, err = filepath.Abs(configPath)
+		if err != nil {
+			return hooks.Installer{}, fmt.Errorf("make config path absolute: %w", err)
+		}
+	}
+	return hooks.Installer{HomeDir: home, Executable: executable, ConfigPath: configPath}, nil
 }
 
 func selectedSources(args []string) ([]domain.Source, error) {

@@ -34,7 +34,7 @@ func NewRootCommand() *cobra.Command {
 	root.PersistentFlags().StringVar(&opts.configPath, "config", "", "configuration file (default: XDG config directory)")
 	root.AddCommand(
 		newVersionCommand(), newInitCommand(&opts), newDoctorCommand(&opts), newStatusCommand(&opts),
-		newHookCommand(&opts), newHooksCommand(), newSkillCommand(&opts), newDaemonCommand(&opts),
+		newHookCommand(&opts), newHooksCommand(&opts), newSkillCommand(&opts), newDaemonCommand(&opts),
 		newLearningCommand(&opts), newClusterCommand(&opts), newModeCommand(&opts),
 	)
 
