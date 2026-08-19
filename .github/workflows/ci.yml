@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  merge_group:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Quality
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+
+      - name: Evaluate flake
+        run: nix flake check
+
+      - name: Run pre-commit checks
+        run: nix develop --command just pre-commit
+
+      - name: Ensure generated files are committed
+        shell: bash
+        run: |
+          if ! git diff --exit-code || [[ -n "$(git status --porcelain)" ]]; then
+            git status --short
+            echo "Pre-commit checks changed the working tree. Commit the generated changes."
+            exit 1
+          fi
+
+      - name: Audit dependencies
+        run: nix develop --command just audit
+
+      - name: Lint workflows
+        run: nix develop --command just lint-ci
+
+  tests:
+    name: Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+
+      - name: Run tests
+        run: nix develop --command just tests
+
+  release-snapshot:
+    name: Release snapshot
+    needs:
+      - quality
+      - tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+
+      - name: Build release snapshot
+        run: nix develop --command just release-local

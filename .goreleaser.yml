@@ -1,0 +1,72 @@
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+---
+version: 2
+project_name: skillloop
+
+builds:
+  - id: skillloop
+    main: .
+    binary: skillloop
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -buildid=
+      - -X github.com/flemzord/skillloop/cmd.Version=v{{ .Version }}
+      - -X github.com/flemzord/skillloop/cmd.Commit={{ .ShortCommit }}
+      - -X github.com/flemzord/skillloop/cmd.BuildDate={{ .Date }}
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - id: skillloop
+    ids:
+      - skillloop
+    formats:
+      - tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
+    wrap_in_directory: true
+    files:
+      - README.md
+      - LICENSE
+
+checksum:
+  name_template: skillloop_checksums.txt
+
+snapshot:
+  version_template: "{{ .Version }}-snapshot"
+
+changelog:
+  use: git
+  sort: asc
+  filters:
+    exclude:
+      - '^chore:'
+      - '^ci:'
+      - '^docs:'
+      - '^style:'
+      - '^test:'
+      - '^Merge '
+  groups:
+    - title: Features
+      regexp: '^feat(\([^)]+\))?!?:'
+      order: 0
+    - title: Bug fixes
+      regexp: '^fix(\([^)]+\))?!?:'
+      order: 10
+    - title: Performance improvements
+      regexp: '^perf(\([^)]+\))?!?:'
+      order: 20
+    - title: Other work
+      order: 999
+
+release:
+  prerelease: auto
+  footer: |
+    Released under the Apache License 2.0.

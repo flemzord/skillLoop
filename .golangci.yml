@@ -1,0 +1,31 @@
+# yaml-language-server: $schema=https://golangci-lint.run/jsonschema/golangci.jsonschema.json
+---
+version: "2"
+
+formatters:
+  enable:
+    - gci
+    - gofmt
+    - goimports
+  settings:
+    gci:
+      sections:
+        - standard
+        - default
+        - prefix(github.com/flemzord/skillloop)
+        - localmodule
+      custom-order: true
+
+linters:
+  default: standard
+  enable:
+    - errorlint
+    - gocritic
+    - misspell
+    - modernize
+    - nolintlint
+    - unconvert
+  settings:
+    staticcheck:
+      checks:
+        - all
