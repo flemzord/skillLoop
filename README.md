@@ -46,7 +46,7 @@ The storage responsibilities are deliberately separate:
 | Data | Location | Behavior |
 | --- | --- | --- |
 | Hook events | `$data_dir/spool` | Successful events are removed after ingestion; failed events remain under `failed/` for diagnosis. |
-| Learning state | `$data_dir/skillloop.db` | SQLite stores session locators, cards, clusters, jobs, proposals, evaluations, promotions, rollbacks, and an audit log. |
+| Learning state | `$data_dir/skillloop.db` | SQLite stores session locators and outcomes, cards, clusters, jobs, proposals, evaluations, promotions, rollbacks, and an audit log. |
 | Source transcripts | Codex or Claude's original path | Read in place. Transcript bodies are not copied into SQLite or the spool. |
 | Candidate changes | `$data_dir/worktrees` | Created on a dedicated `skillloop/...` branch without staging, resetting, or cleaning the source checkout. |
 | Promoted versions | `$data_dir/releases/<skill-id>` | Read-only snapshots selected by atomic `current` and `previous` symlinks. |
@@ -64,7 +64,7 @@ The storage responsibilities are deliberately separate:
 - **Reversible promotion:** promotion does not edit the source checkout's files or index. It pins the approved commits under SkillLoop-owned Git refs, then uses immutable releases and atomic symlinks as the rollback boundary.
 - **Loop prevention:** add a `.skillloop-ignore` file to a directory, or configure `excluded_paths`, to exclude SkillLoop's own work and any other subtree.
 
-SkillLoop v0.1.0 has no time-based retention window. SQLite metadata, failed spool events, and releases remain until you remove them deliberately. Pending/evaluated candidate worktrees remain reviewable; promotion or rejection cleans them up. Treat the configured data directory as sensitive local data and include its lifecycle in your own retention policy.
+Operational metadata is pruned on each daemon drain. By default, transcript locators are cleared after 30 days, failed spool events and completed jobs after 7 days, and failed jobs after 30 days. The source transcript itself is never deleted. Learning cards, clusters, proposals, releases, rollbacks, and audit entries remain durable; pending/evaluated candidate worktrees remain reviewable until promotion or rejection cleans them up. Set an individual retention duration to `0s` to keep that operational category indefinitely.
 
 ## Installation
 
@@ -183,6 +183,8 @@ skillloop proposal create <cluster-id>
 skillloop proposal evaluate <proposal-id>
 ```
 
+The built-in structural evaluation makes a proposal inspectable, but it is not sufficient proof for promotion. Before the final `proposal evaluate`, configure `evaluation.command` with a task-level evaluator. SkillLoop runs the argument vector in exact baseline and candidate worktrees; promotion requires the baseline run to fail, the candidate run to pass, neither run to time out, and both stored revisions to match the proposal exactly. Re-running `proposal evaluate` replaces earlier structural-only evidence.
+
 Review the persisted evidence and evaluation results:
 
 ```sh
@@ -201,7 +203,7 @@ skillloop proposal approve <proposal-id>
 skillloop proposal reject <proposal-id> --reason "does not generalize"
 ```
 
-Approval rechecks the persisted evaluation, minimum improvement, exact commits, branch, and diff before it switches the immutable release. After the first promotion, expose the stable `current` release to both agents (or pass `--codex-only` / `--claude-only`):
+Approval rechecks the persisted external baseline/candidate pair, minimum improvement, exact commits, branch, and diff before it switches the immutable release. Structural-only evidence is rejected. After the first promotion, expose the stable `current` release to both agents (or pass `--codex-only` / `--claude-only`):
 
 ```sh
 skillloop skill install <skill-id>
@@ -268,6 +270,11 @@ evaluation:
   command: []
   minimum_improvement: 0.1
   allow_autopilot: false
+retention:
+  transcript_locators: 720h
+  failed_spool: 168h
+  completed_jobs: 168h
+  failed_jobs: 720h
 excluded_paths:
   - /absolute/path/to/private-or-recursive-work
 ```
@@ -277,7 +284,9 @@ Notes:
 - `aggregation.minimum_sessions` must be at least `2`.
 - `poll_interval` must be positive.
 - `evaluation.minimum_improvement` cannot be negative.
+- Promotion in both `propose` and `autopilot` requires an external baseline-fail / candidate-pass pair from `evaluation.command` at the exact proposal revisions.
 - `autopilot` requires both `allow_autopilot: true` and a non-empty external evaluation command.
+- Retention durations cannot be negative; `0s` explicitly keeps that operational category indefinitely. Durable learning and audit state is not pruned by these settings.
 - `skillloop --config /path/to/config.yaml ...` overrides the configuration. When that flag is present during `hooks install`, SkillLoop records the absolute custom config path in each installed hook; use the same flag to uninstall those exact handlers.
 - `skillloop init` refuses to overwrite an existing configuration.
 
@@ -346,8 +355,8 @@ CI evaluates the Nix flake, runs formatting/lint/tests/build/audit checks, tests
 - Recurrence uses exact sanitized fingerprints rather than semantic similarity.
 - Only a tracked file named `SKILL.md` is eligible for candidate generation. v0.1.0 does not patch scripts, fixtures, examples, or multiple files.
 - Candidates add or replace a small SkillLoop-managed guidance block; there is no free-form model-generated rewrite.
-- The built-in derived-case evaluator proves that the learned guidance is absent in the baseline and present exactly in the candidate. Configure an external evaluator for task-level evidence.
-- There is no built-in daemon/monitor service installer, scheduler, web UI, remote synchronization, automatic retention/pruning, or Windows release artifact.
+- The built-in derived-case evaluator proves only that the learned guidance is absent in the baseline and present exactly in the candidate. Promotion always requires a configured external evaluator for task-level evidence.
+- There is no built-in daemon/monitor service installer, scheduler, web UI, remote synchronization, pruning of durable learning/audit history, or Windows release artifact.
 
 ## Contributing, security, and license
 
