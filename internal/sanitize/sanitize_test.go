@@ -22,3 +22,13 @@ func TestFingerprintRemovesVolatileNumbers(t *testing.T) {
 		t.Fatalf("expected stable fingerprints, got %q and %q", left, right)
 	}
 }
+
+func TestTextTruncationPreservesUTF8(t *testing.T) {
+	result := Text(strings.Repeat("é", maximumFactLength+1))
+	if !strings.HasSuffix(result, "…") {
+		t.Fatalf("expected truncated value, got %q", result)
+	}
+	if got := len([]rune(strings.TrimSuffix(result, "…"))); got != maximumFactLength {
+		t.Fatalf("expected %d runes, got %d", maximumFactLength, got)
+	}
+}

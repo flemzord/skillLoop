@@ -92,6 +92,10 @@ func (spool Spool) Write(event domain.HookEvent) (string, error) {
 		cleanup()
 		return "", fmt.Errorf("encode spool event: %w", err)
 	}
+	if err := temporary.Sync(); err != nil {
+		cleanup()
+		return "", fmt.Errorf("sync spool event: %w", err)
+	}
 	if err := temporary.Close(); err != nil {
 		cleanup()
 		return "", fmt.Errorf("close spool event: %w", err)

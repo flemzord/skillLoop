@@ -33,22 +33,24 @@ func (analyzer Analyzer) Analyze(session domain.Session, skills []domain.Skill) 
 		sessionRef = string(session.Source) + ":" + session.ExternalID
 	}
 	cards := make([]domain.LearningCard, 0, 4)
+	toolCalls := correlateToolCalls(session.Messages)
 	for index, message := range session.Messages {
 		switch {
 		case message.Role == "user" && correctionPattern.MatchString(message.Text):
 			lesson := sanitize.Text(message.Text)
 			cards = append(cards, analyzer.card(sessionRef, skill.ID, domain.CardCorrection, lesson, "Explicit user correction", 0.9))
-		case message.Role == "tool" && message.Failed:
-			recovery := nextSuccessfulTool(session.Messages[index+1:], message.ToolName)
-			fact := sanitize.Text(message.ToolName + " " + message.Text)
+		case message.Role == "tool" && message.ToolResult && message.Failed:
+			call := toolCalls[index]
+			recovery := nextSuccessfulTool(session.Messages, toolCalls, index+1, message.ToolName)
+			fact := sanitize.Text(message.ToolName + " " + call.Text + " " + message.Text)
 			lesson := "Handle the recurring failure before continuing"
 			if recovery != "" {
 				lesson = "After this failure, use the validated recovery: " + sanitize.Text(recovery)
 			}
 			cards = append(cards, analyzer.card(sessionRef, skill.ID, domain.CardFailure, fact, "Recurring tool failure", 0.8))
 			cards[len(cards)-1].Lesson = lesson
-		case message.Role == "tool" && !message.Failed && isValidation(message.Text):
-			command := validationCommand(message.Text)
+		case message.Role == "tool" && message.ToolResult && !message.Failed && isValidation(toolCalls[index].Text):
+			command := validationCommand(toolCalls[index].Text)
 			cards = append(cards, analyzer.card(sessionRef, skill.ID, domain.CardValidation, command, "Successful validation step", 0.75))
 		}
 	}
@@ -122,13 +124,50 @@ func attributedSkill(session domain.Session, skills []domain.Skill) (domain.Skil
 	return best.skill, unique
 }
 
-func nextSuccessfulTool(messages []domain.Message, name string) string {
-	for _, message := range messages {
-		if message.Role != "tool" || message.Failed {
+func correlateToolCalls(messages []domain.Message) map[int]domain.Message {
+	byID := make(map[string]domain.Message)
+	latestByName := make(map[string]domain.Message)
+	result := make(map[int]domain.Message)
+	for index, message := range messages {
+		if message.Role != "tool" {
+			continue
+		}
+		if !message.ToolResult {
+			if message.ToolCallID != "" {
+				byID[message.ToolCallID] = message
+			} else {
+				latestByName[strings.ToLower(message.ToolName)] = message
+			}
+			continue
+		}
+		if message.ToolCallID != "" {
+			if call, ok := byID[message.ToolCallID]; ok {
+				result[index] = call
+				delete(byID, message.ToolCallID)
+			}
+			continue
+		}
+		key := strings.ToLower(message.ToolName)
+		if call, ok := latestByName[key]; ok {
+			result[index] = call
+			delete(latestByName, key)
+		}
+	}
+	return result
+}
+
+func nextSuccessfulTool(messages []domain.Message, toolCalls map[int]domain.Message, start int, name string) string {
+	for index := start; index < len(messages); index++ {
+		message := messages[index]
+		if message.Role != "tool" || !message.ToolResult || message.Failed {
+			continue
+		}
+		call, ok := toolCalls[index]
+		if !ok {
 			continue
 		}
 		if name == "" || message.ToolName == "" || strings.EqualFold(name, message.ToolName) {
-			return message.Text
+			return call.Text
 		}
 	}
 	return ""

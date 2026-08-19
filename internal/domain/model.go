@@ -46,10 +46,12 @@ type HookEvent struct {
 }
 
 type Message struct {
-	Role     string
-	Text     string
-	ToolName string
-	Failed   bool
+	Role       string
+	Text       string
+	ToolName   string
+	ToolCallID string
+	ToolResult bool
+	Failed     bool
 }
 
 type Session struct {

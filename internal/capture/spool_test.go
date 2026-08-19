@@ -87,9 +87,7 @@ func TestSpoolConcurrentWritersDoNotCorruptEvents(t *testing.T) {
 	errorsChannel := make(chan error, writers)
 	wait := sync.WaitGroup{}
 	for index := range writers {
-		wait.Add(1)
-		go func() {
-			defer wait.Done()
+		wait.Go(func() {
 			_, err := spool.Write(domain.HookEvent{
 				Source:        domain.SourceCodex,
 				SessionID:     "session",
@@ -98,7 +96,7 @@ func TestSpoolConcurrentWritersDoNotCorruptEvents(t *testing.T) {
 				HookEventName: "stop",
 			})
 			errorsChannel <- err
-		}()
+		})
 	}
 	wait.Wait()
 	close(errorsChannel)

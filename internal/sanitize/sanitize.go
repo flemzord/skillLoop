@@ -22,15 +22,16 @@ func Text(value string) string {
 	value = secretPattern.ReplaceAllString(value, "[REDACTED_SECRET]")
 	value = emailPattern.ReplaceAllString(value, "[REDACTED_EMAIL]")
 	value = queryPattern.ReplaceAllStringFunc(value, func(raw string) string {
-		if index := strings.IndexByte(raw, '?'); index >= 0 {
-			return raw[:index] + "?[REDACTED_QUERY]"
+		if prefix, _, found := strings.Cut(raw, "?"); found {
+			return prefix + "?[REDACTED_QUERY]"
 		}
 		return raw
 	})
 	value = homePattern.ReplaceAllString(value, "~")
 	value = strings.TrimSpace(spacesPattern.ReplaceAllString(value, " "))
-	if len(value) > maximumFactLength {
-		value = value[:maximumFactLength] + "…"
+	runes := []rune(value)
+	if len(runes) > maximumFactLength {
+		value = string(runes[:maximumFactLength]) + "…"
 	}
 	return value
 }

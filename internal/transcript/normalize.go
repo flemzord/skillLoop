@@ -8,12 +8,15 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"regexp"
 	"strings"
 
 	"github.com/flemzord/skillloop/internal/domain"
 )
 
 const maximumLineSize = 8 << 20
+
+var failedExitPattern = regexp.MustCompile(`(?i)(?:exit(?:ed)?(?: with)? (?:status|code)|exit_code["']?\s*:)\s*[1-9][0-9]*`)
 
 type Normalizer struct{}
 
@@ -100,11 +103,12 @@ func parseCodex(record map[string]any, toolNames map[string]string) []domain.Mes
 		if callID != "" {
 			toolNames[callID] = name
 		}
-		return []domain.Message{{Role: "tool", ToolName: name, Text: firstString(payload, "arguments", "input")}}
+		return []domain.Message{{Role: "tool", ToolName: name, ToolCallID: callID, Text: firstString(payload, "arguments", "input")}}
 	case typeName == "response_item" && (payloadType == "function_call_output" || payloadType == "custom_tool_call_output"):
 		output := firstString(payload, "output", "content")
-		name := toolNames[firstString(payload, "call_id", "id")]
-		return []domain.Message{{Role: "tool", ToolName: name, Text: output, Failed: looksFailed(output)}}
+		callID := firstString(payload, "call_id", "id")
+		name := toolNames[callID]
+		return []domain.Message{{Role: "tool", ToolName: name, ToolCallID: callID, ToolResult: true, Text: output, Failed: looksFailed(output)}}
 	default:
 		return nil
 	}
@@ -141,12 +145,13 @@ func parseClaude(record map[string]any, toolNames map[string]string) []domain.Me
 			if id != "" {
 				toolNames[id] = name
 			}
-			parsed = append(parsed, domain.Message{Role: "tool", ToolName: name, Text: jsonText(content["input"])})
+			parsed = append(parsed, domain.Message{Role: "tool", ToolName: name, ToolCallID: id, Text: jsonText(content["input"])})
 		case "tool_result":
 			text := contentText(content["content"])
 			failed, _ := content["is_error"].(bool)
-			name := toolNames[stringValue(content["tool_use_id"])]
-			parsed = append(parsed, domain.Message{Role: "tool", ToolName: name, Text: text, Failed: failed || looksFailed(text)})
+			callID := stringValue(content["tool_use_id"])
+			name := toolNames[callID]
+			parsed = append(parsed, domain.Message{Role: "tool", ToolName: name, ToolCallID: callID, ToolResult: true, Text: text, Failed: failed || looksFailed(text)})
 		}
 	}
 	return parsed
@@ -187,7 +192,8 @@ func compact(messages []domain.Message) []domain.Message {
 		}
 		if len(result) > 0 {
 			previous := result[len(result)-1]
-			if previous.Role == message.Role && previous.Text == message.Text && previous.ToolName == message.ToolName && previous.Failed == message.Failed {
+			if previous.Role == message.Role && previous.Text == message.Text && previous.ToolName == message.ToolName &&
+				previous.ToolCallID == message.ToolCallID && previous.ToolResult == message.ToolResult && previous.Failed == message.Failed {
 				continue
 			}
 		}
@@ -213,10 +219,8 @@ func contentText(value any) string {
 
 func looksFailed(text string) bool {
 	lower := strings.ToLower(text)
-	return strings.Contains(lower, "exit code 1") ||
-		strings.Contains(lower, "exit_code\":1") ||
+	return failedExitPattern.MatchString(text) ||
 		strings.Contains(lower, "iserror\":true") ||
-		strings.Contains(lower, "error:") ||
 		strings.Contains(lower, "command failed")
 }
 

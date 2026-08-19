@@ -12,7 +12,7 @@ import (
 func TestNormalizeCodexTranscript(t *testing.T) {
 	path := writeTranscript(t, `{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Use the go-service skill"}]}}
 {"type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"call-1","arguments":"{\"cmd\":\"go test ./...\"}"}}
-{"type":"response_item","payload":{"type":"function_call_output","call_id":"call-1","output":"exit code 1: package failed"}}
+{"type":"response_item","payload":{"type":"function_call_output","call_id":"call-1","output":"Process exited with code 1\nFinal output:\npackage failed"}}
 {"type":"event_msg","payload":{"type":"agent_message","message":"I will fix it."}}
 `)
 	session, err := (Normalizer{}).Normalize(context.Background(), domain.HookEvent{
@@ -27,7 +27,10 @@ func TestNormalizeCodexTranscript(t *testing.T) {
 	if session.Reference != "codex:session-1" {
 		t.Fatalf("unexpected stable session reference: %s", session.Reference)
 	}
-	if !session.Messages[2].Failed || session.Messages[2].ToolName != "exec_command" {
+	if session.Messages[1].ToolResult || session.Messages[1].ToolCallID != "call-1" {
+		t.Fatalf("expected an explicit tool call, got %#v", session.Messages[1])
+	}
+	if !session.Messages[2].ToolResult || !session.Messages[2].Failed || session.Messages[2].ToolName != "exec_command" || session.Messages[2].ToolCallID != "call-1" {
 		t.Fatalf("expected correlated failed tool result, got %#v", session.Messages[2])
 	}
 }
@@ -47,7 +50,10 @@ func TestNormalizeClaudeTranscript(t *testing.T) {
 	if len(session.Messages) != 3 {
 		t.Fatalf("expected 3 messages, got %#v", session.Messages)
 	}
-	if session.Messages[2].Failed || session.Messages[2].ToolName != "Bash" {
+	if session.Messages[1].ToolResult || session.Messages[1].ToolCallID != "tool-1" {
+		t.Fatalf("expected an explicit tool call, got %#v", session.Messages[1])
+	}
+	if !session.Messages[2].ToolResult || session.Messages[2].Failed || session.Messages[2].ToolName != "Bash" || session.Messages[2].ToolCallID != "tool-1" {
 		t.Fatalf("expected successful correlated tool result, got %#v", session.Messages[2])
 	}
 }
