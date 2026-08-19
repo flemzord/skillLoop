@@ -80,6 +80,51 @@ func TestAnalyzeDoesNotInferValidationFromResultText(t *testing.T) {
 	}
 }
 
+func TestAnalyzeDoesNotTreatUnrelatedSuccessfulToolAsRecovery(t *testing.T) {
+	session := domain.Session{
+		Source: domain.SourceCodex, ExternalID: "session-unrelated-recovery",
+		Messages: []domain.Message{
+			{Role: "assistant", Text: "Loaded /skills/go-service/SKILL.md"},
+			{Role: "tool", ToolName: "Bash", ToolCallID: "call-1", Text: `{"command":"go test ./..."}`},
+			{Role: "tool", ToolName: "Bash", ToolCallID: "call-1", ToolResult: true, Text: "exit code 1", Failed: true},
+			{Role: "tool", ToolName: "Bash", ToolCallID: "call-2", Text: `{"command":"git status --short"}`},
+			{Role: "tool", ToolName: "Bash", ToolCallID: "call-2", ToolResult: true, Text: "clean"},
+		},
+	}
+	skills := []domain.Skill{{
+		ID: "skill-1", Name: "go-service", RepositoryPath: "/skills/go-service",
+		InstructionPath: "SKILL.md", Enabled: true,
+	}}
+	cards := NewAnalyzer().Analyze(session, skills)
+	if len(cards) != 1 || cards[0].Kind != domain.CardFailure {
+		t.Fatalf("expected one failure card, got %#v", cards)
+	}
+	if contains(cards[0].Lesson, "git status") || contains(cards[0].Lesson, "validated recovery") {
+		t.Fatalf("unrelated success was retained as a recovery: %#v", cards[0])
+	}
+}
+
+func TestCommandFamilyUnwrapsCommonCommandPayloads(t *testing.T) {
+	tests := []struct {
+		name      string
+		failed    string
+		candidate string
+		related   bool
+	}{
+		{name: "validation wrapper", failed: `{"cmd":"go test ./..."}`, candidate: `{"command":"nix develop --command go test ./..."}`, related: true},
+		{name: "same subcommand", failed: `{"command":"git status"}`, candidate: `{"command":"sudo git status --short"}`, related: true},
+		{name: "different subcommand", failed: `{"command":"git status"}`, candidate: `{"command":"git add ."}`, related: false},
+		{name: "shell wrapper", failed: `{"command":"make verify"}`, candidate: `{"command":"bash -c 'make verify'"}`, related: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := relatedToolCalls(test.failed, test.candidate); got != test.related {
+				t.Fatalf("relatedToolCalls() = %v, want %v", got, test.related)
+			}
+		})
+	}
+}
+
 func TestAnalyzeRejectsAmbiguousAttribution(t *testing.T) {
 	session := domain.Session{Source: domain.SourceClaude, ExternalID: "session-2", Messages: []domain.Message{
 		{Role: "assistant", Text: "Use alpha and beta"},

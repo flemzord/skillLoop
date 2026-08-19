@@ -200,6 +200,18 @@ func (processor Processor) processFile(ctx context.Context, directories spoolDir
 		}
 		return DrainResult{Failed: 1}, cause
 	}
+	acknowledge := func() (DrainResult, error) {
+		if err := os.Remove(processingPath); err != nil {
+			return fail("", fmt.Errorf("daemon: acknowledge terminal event: %w", err))
+		}
+		return DrainResult{Processed: 1}, nil
+	}
+	deferToLeaseOwner := func() (DrainResult, error) {
+		if err := os.Rename(processingPath, incomingPath); err != nil {
+			return fail("", fmt.Errorf("daemon: defer leased event: %w", err))
+		}
+		return DrainResult{}, nil
+	}
 
 	contents, err := os.ReadFile(processingPath)
 	if err != nil {
@@ -225,17 +237,20 @@ func (processor Processor) processFile(ctx context.Context, directories spoolDir
 		return fail(event.ID, fmt.Errorf("daemon: enqueue ingest job: %w", err))
 	}
 	if !created {
-		if err := os.Remove(processingPath); err != nil {
-			return fail("", fmt.Errorf("daemon: acknowledge duplicate event: %w", err))
+		existing, err := processor.Store.Job(ctx, event.ID)
+		if err != nil {
+			return fail("", fmt.Errorf("daemon: inspect duplicate ingest job: %w", err))
 		}
-		return DrainResult{Processed: 1}, nil
+		if existing.Status == domain.JobCompleted || existing.Status == domain.JobFailed {
+			return acknowledge()
+		}
 	}
 	claimed, ok, err := processor.Store.ClaimJob(ctx, event.ID, time.Minute)
 	if err != nil {
 		return fail(event.ID, fmt.Errorf("daemon: claim ingest job: %w", err))
 	}
 	if !ok || claimed.ID != event.ID {
-		return fail(event.ID, errors.New("daemon: ingest job is not claimable"))
+		return deferToLeaseOwner()
 	}
 
 	if excluded(event.WorkingDir, processor.Config.ExcludedPaths) {

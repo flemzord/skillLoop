@@ -347,6 +347,16 @@ func TestJobsAreIdempotentAndLeased(t *testing.T) {
 	if err != nil || created {
 		t.Fatalf("enqueue duplicate job: created=%v err=%v", created, err)
 	}
+	persisted, err := store.Job(ctx, "job-1")
+	if err != nil {
+		t.Fatalf("get job: %v", err)
+	}
+	if persisted.ID != "job-1" || persisted.Status != domain.JobQueued || persisted.IdempotencyKey != job.IdempotencyKey {
+		t.Fatalf("unexpected persisted job: %#v", persisted)
+	}
+	if _, err := store.Job(ctx, "missing-job"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing job error = %v, want ErrNotFound", err)
+	}
 
 	jobs, err := store.ClaimJobs(ctx, 10, time.Minute)
 	if err != nil {

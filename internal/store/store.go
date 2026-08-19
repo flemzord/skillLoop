@@ -518,6 +518,23 @@ func (s *Store) EnqueueJob(ctx context.Context, job domain.Job) (bool, error) {
 	return rowsChanged(result)
 }
 
+func (s *Store) Job(ctx context.Context, id string) (domain.Job, error) {
+	if id == "" {
+		return domain.Job{}, errors.New("store: job id is required")
+	}
+	job, err := scanJob(s.db.QueryRowContext(ctx, `
+		SELECT id, kind, idempotency_key, payload, status, attempts,
+		       available_at, leased_until, last_error, created_at, updated_at
+		FROM jobs WHERE id = ?`, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.Job{}, ErrNotFound
+	}
+	if err != nil {
+		return domain.Job{}, fmt.Errorf("store: get job %q: %w", id, err)
+	}
+	return job, nil
+}
+
 // ClaimJob leases exactly the requested job. It never substitutes another
 // queued item, which keeps a filesystem event causally tied to its durable job.
 // A processing job can only be reclaimed after its lease expires.

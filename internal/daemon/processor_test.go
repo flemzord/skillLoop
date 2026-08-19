@@ -205,6 +205,137 @@ func TestDrainClaimsTheJobMatchingTheCurrentSpoolEvent(t *testing.T) {
 	}
 }
 
+func TestDrainResumesRecoveredQueuedAndExpiredJobs(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		processing bool
+	}{
+		{name: "queued"},
+		{name: "expired processing", processing: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			dataDir := t.TempDir()
+			database, err := store.Open(ctx, filepath.Join(dataDir, "skillloop.db"))
+			if err != nil {
+				t.Fatalf("open store: %v", err)
+			}
+			t.Cleanup(func() { _ = database.Close() })
+
+			event, settings, directories := recoveredEventFixture(t, dataDir, "recovered-"+strings.ReplaceAll(test.name, " ", "-"))
+			job := domain.Job{
+				ID: event.ID, Kind: ingestJobKind, IdempotencyKey: "hook:" + event.ID,
+				Payload: event.ID, Status: domain.JobQueued, AvailableAt: time.Now().Add(-time.Minute),
+			}
+			if created, err := database.EnqueueJob(ctx, job); err != nil || !created {
+				t.Fatalf("enqueue recovered job: created=%v err=%v", created, err)
+			}
+			if test.processing {
+				claimed, ok, err := database.ClaimJob(ctx, event.ID, time.Nanosecond)
+				if err != nil || !ok || claimed.ID != event.ID {
+					t.Fatalf("claim recovered job: job=%#v ok=%v err=%v", claimed, ok, err)
+				}
+				for !time.Now().After(claimed.LeasedUntil) {
+					time.Sleep(time.Millisecond)
+				}
+			}
+
+			result, err := (Processor{Config: settings, Store: database}).Drain(ctx, 10)
+			if err != nil {
+				t.Fatalf("drain recovered job: %v", err)
+			}
+			if result.Excluded != 1 || result.Failed != 0 {
+				t.Fatalf("recovered result = %#v, want one exclusion", result)
+			}
+			persisted, err := database.Job(ctx, event.ID)
+			if err != nil || persisted.Status != domain.JobCompleted {
+				t.Fatalf("recovered job = %#v err=%v, want completed", persisted, err)
+			}
+			for _, path := range []string{
+				filepath.Join(directories.incoming, event.ID+".json"),
+				filepath.Join(directories.processing, event.ID+".json"),
+			} {
+				if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("acknowledged spool path still exists %s: %v", path, err)
+				}
+			}
+		})
+	}
+}
+
+func TestDrainDefersRecoveredEventWithLiveLease(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	database, err := store.Open(ctx, filepath.Join(dataDir, "skillloop.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+
+	event, settings, directories := recoveredEventFixture(t, dataDir, "live-lease")
+	job := domain.Job{
+		ID: event.ID, Kind: ingestJobKind, IdempotencyKey: "hook:" + event.ID,
+		Payload: event.ID, Status: domain.JobQueued, AvailableAt: time.Now().Add(-time.Minute),
+	}
+	if created, err := database.EnqueueJob(ctx, job); err != nil || !created {
+		t.Fatalf("enqueue live job: created=%v err=%v", created, err)
+	}
+	claimed, ok, err := database.ClaimJob(ctx, event.ID, time.Hour)
+	if err != nil || !ok {
+		t.Fatalf("claim live job: ok=%v err=%v", ok, err)
+	}
+
+	result, err := (Processor{Config: settings, Store: database}).Drain(ctx, 10)
+	if err != nil {
+		t.Fatalf("drain live job: %v", err)
+	}
+	if result.Failed != 0 || result.Processed != 0 || result.Excluded != 0 {
+		t.Fatalf("live lease result = %#v, want deferred event", result)
+	}
+	persisted, err := database.Job(ctx, event.ID)
+	if err != nil || persisted.Status != domain.JobProcessing || persisted.LeasedUntil != claimed.LeasedUntil {
+		t.Fatalf("live job changed: before=%#v after=%#v err=%v", claimed, persisted, err)
+	}
+	if _, err := os.Stat(filepath.Join(directories.incoming, event.ID+".json")); err != nil {
+		t.Fatalf("deferred event was not returned to incoming: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(directories.processing, event.ID+".json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("processing copy remains after deferral: %v", err)
+	}
+}
+
+func recoveredEventFixture(t *testing.T, dataDir, eventID string) (domain.HookEvent, config.Config, spoolDirectories) {
+	t.Helper()
+	directories, err := ensureSpoolDirectories(dataDir)
+	if err != nil {
+		t.Fatalf("ensure spool directories: %v", err)
+	}
+	workingDir := filepath.Join(dataDir, "excluded-"+eventID)
+	if err := os.MkdirAll(workingDir, 0o700); err != nil {
+		t.Fatalf("create excluded directory: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(workingDir, ".skillloop-ignore"), nil, 0o600); err != nil {
+		t.Fatalf("write exclusion marker: %v", err)
+	}
+	event := domain.HookEvent{
+		ID: eventID, Source: domain.SourceCodex, SessionID: "session-" + eventID,
+		WorkingDir: workingDir, HookEventName: "stop", CapturedAt: time.Now(),
+	}
+	incomingPath, err := (capture.Spool{DataDir: dataDir}).Write(event)
+	if err != nil {
+		t.Fatalf("write recovered event: %v", err)
+	}
+	if err := os.Rename(incomingPath, filepath.Join(directories.processing, filepath.Base(incomingPath))); err != nil {
+		t.Fatalf("stage processing event: %v", err)
+	}
+	settings, err := config.Default()
+	if err != nil {
+		t.Fatalf("default config: %v", err)
+	}
+	settings.DataDir = dataDir
+	return event, settings, directories
+}
+
 func TestDrainPrunesOnlyExpiredOperationalData(t *testing.T) {
 	ctx := context.Background()
 	dataDir := t.TempDir()

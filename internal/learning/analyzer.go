@@ -3,6 +3,7 @@ package learning
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"path/filepath"
 	"regexp"
@@ -41,7 +42,7 @@ func (analyzer Analyzer) Analyze(session domain.Session, skills []domain.Skill) 
 			cards = append(cards, analyzer.card(sessionRef, skill.ID, domain.CardCorrection, lesson, "Explicit user correction", 0.9))
 		case message.Role == "tool" && message.ToolResult && message.Failed:
 			call := toolCalls[index]
-			recovery := nextSuccessfulTool(session.Messages, toolCalls, index+1, message.ToolName)
+			recovery := nextSuccessfulTool(session.Messages, toolCalls, index+1, message.ToolName, call)
 			fact := sanitize.Text(message.ToolName + " " + call.Text + " " + message.Text)
 			lesson := "Handle the recurring failure before continuing"
 			if recovery != "" {
@@ -156,7 +157,13 @@ func correlateToolCalls(messages []domain.Message) map[int]domain.Message {
 	return result
 }
 
-func nextSuccessfulTool(messages []domain.Message, toolCalls map[int]domain.Message, start int, name string) string {
+func nextSuccessfulTool(
+	messages []domain.Message,
+	toolCalls map[int]domain.Message,
+	start int,
+	name string,
+	failedCall domain.Message,
+) string {
 	for index := start; index < len(messages); index++ {
 		message := messages[index]
 		if message.Role != "tool" || !message.ToolResult || message.Failed {
@@ -166,11 +173,59 @@ func nextSuccessfulTool(messages []domain.Message, toolCalls map[int]domain.Mess
 		if !ok {
 			continue
 		}
-		if name == "" || message.ToolName == "" || strings.EqualFold(name, message.ToolName) {
+		if (name == "" || message.ToolName == "" || strings.EqualFold(name, message.ToolName)) &&
+			relatedToolCalls(failedCall.Text, call.Text) {
 			return call.Text
 		}
 	}
 	return ""
+}
+
+func relatedToolCalls(failed, candidate string) bool {
+	failedFamily := commandFamily(failed)
+	return failedFamily != "" && failedFamily == commandFamily(candidate)
+}
+
+func commandFamily(value string) string {
+	command := commandText(value)
+	if isValidation(command) {
+		return validationCommand(command)
+	}
+	fields := strings.Fields(strings.ToLower(command))
+	for len(fields) > 0 && strings.Contains(fields[0], "=") {
+		fields = fields[1:]
+	}
+	for len(fields) > 0 && (fields[0] == "sudo" || fields[0] == "env") {
+		fields = fields[1:]
+		for len(fields) > 0 && strings.HasPrefix(fields[0], "-") {
+			fields = fields[1:]
+		}
+		for len(fields) > 0 && strings.Contains(fields[0], "=") {
+			fields = fields[1:]
+		}
+	}
+	if len(fields) >= 3 && (fields[0] == "sh" || fields[0] == "bash" || fields[0] == "zsh") && fields[1] == "-c" {
+		return commandFamily(strings.Trim(strings.Join(fields[2:], " "), "'\""))
+	}
+	if len(fields) == 0 {
+		return ""
+	}
+	if len(fields) == 1 {
+		return strings.Trim(fields[0], "'\"")
+	}
+	return strings.Trim(fields[0], "'\"") + " " + strings.Trim(fields[1], "'\"")
+}
+
+func commandText(value string) string {
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(value), &payload); err == nil {
+		for _, key := range []string{"command", "cmd"} {
+			if command, ok := payload[key].(string); ok {
+				return command
+			}
+		}
+	}
+	return value
 }
 
 func isValidation(value string) bool {
