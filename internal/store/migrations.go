@@ -96,7 +96,8 @@ CREATE TABLE evaluation_results (
 	score REAL NOT NULL,
 	duration_ns INTEGER NOT NULL CHECK (duration_ns >= 0),
 	details TEXT NOT NULL,
-	created_at INTEGER NOT NULL
+	created_at INTEGER NOT NULL,
+	UNIQUE(proposal_id, variant)
 );
 
 CREATE TABLE promotions (
@@ -142,6 +143,9 @@ CREATE INDEX jobs_available_idx
 	ON jobs(status, available_at, leased_until);
 CREATE INDEX proposals_status_idx
 	ON proposals(status, updated_at);
+CREATE UNIQUE INDEX proposals_one_live_per_cluster
+	ON proposals(cluster_id)
+	WHERE status IN ('pending', 'evaluated', 'approved', 'promoted');
 CREATE INDEX audit_entity_idx
 	ON audit_log(entity_type, entity_id, id);
 `
@@ -151,7 +155,7 @@ func (s *Store) migrate(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("store: begin migration: %w", err)
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	if _, err := tx.ExecContext(ctx, `
 		CREATE TABLE IF NOT EXISTS schema_migrations (

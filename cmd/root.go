@@ -36,6 +36,7 @@ func NewRootCommand() *cobra.Command {
 		newVersionCommand(), newInitCommand(&opts), newDoctorCommand(&opts), newStatusCommand(&opts),
 		newHookCommand(&opts), newHooksCommand(&opts), newSkillCommand(&opts), newDaemonCommand(&opts),
 		newLearningCommand(&opts), newClusterCommand(&opts), newModeCommand(&opts),
+		newProposalCommand(&opts), newRollbackCommand(&opts), newMonitorCommand(&opts),
 	)
 
 	return root

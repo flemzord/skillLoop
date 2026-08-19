@@ -18,6 +18,7 @@ import (
 	"github.com/flemzord/skillloop/internal/config"
 	"github.com/flemzord/skillloop/internal/domain"
 	"github.com/flemzord/skillloop/internal/learning"
+	"github.com/flemzord/skillloop/internal/pipeline"
 	"github.com/flemzord/skillloop/internal/store"
 	"github.com/flemzord/skillloop/internal/transcript"
 )
@@ -33,12 +34,19 @@ type Processor struct {
 }
 
 type DrainResult struct {
-	Captured         int
-	Processed        int
-	Excluded         int
-	Failed           int
-	CardsCreated     int
-	EligibleClusters []domain.Cluster
+	Captured             int
+	Processed            int
+	Excluded             int
+	Failed               int
+	CardsCreated         int
+	EligibleClusters     []domain.Cluster
+	ProposalsCreated     int
+	ProposalsEvaluated   int
+	ProposalsPromoted    int
+	ProposalFailures     int
+	PromotionsMonitored  int
+	PromotionsRolledBack int
+	MonitorFailures      int
 }
 
 func (processor Processor) Drain(ctx context.Context, limit int) (DrainResult, error) {
@@ -92,6 +100,24 @@ func (processor Processor) Drain(ctx context.Context, limit int) (DrainResult, e
 		return result, fmt.Errorf("daemon: rebuild clusters: %w", err)
 	}
 	result.EligibleClusters = clusters
+	workflow := pipeline.New(processor.Config, processor.Store)
+	proposalResult, err := workflow.ProcessEligible(ctx, clusters)
+	if err != nil {
+		return result, fmt.Errorf("daemon: process proposals: %w", err)
+	}
+	result.ProposalsCreated = proposalResult.Created
+	result.ProposalsEvaluated = proposalResult.Evaluated
+	result.ProposalsPromoted = proposalResult.Promoted
+	result.ProposalFailures = len(proposalResult.Failures)
+	if processor.Config.Mode != domain.ModeObserve {
+		monitorResult, monitorErr := workflow.Monitor(ctx)
+		if monitorErr != nil {
+			return result, fmt.Errorf("daemon: monitor promotions: %w", monitorErr)
+		}
+		result.PromotionsMonitored = monitorResult.Checked
+		result.PromotionsRolledBack = monitorResult.RolledBack
+		result.MonitorFailures = len(monitorResult.Failures)
+	}
 	return result, nil
 }
 
@@ -139,12 +165,12 @@ func (processor Processor) processFile(ctx context.Context, directories spoolDir
 		}
 		return DrainResult{Processed: 1}, nil
 	}
-	claimed, err := processor.Store.ClaimJobs(ctx, 1, time.Minute)
+	claimed, ok, err := processor.Store.ClaimJob(ctx, event.ID, time.Minute)
 	if err != nil {
 		return fail(event.ID, fmt.Errorf("daemon: claim ingest job: %w", err))
 	}
-	if len(claimed) != 1 || claimed[0].ID != event.ID {
-		return fail(event.ID, errors.New("daemon: claimed an unexpected ingest job"))
+	if !ok || claimed.ID != event.ID {
+		return fail(event.ID, errors.New("daemon: ingest job is not claimable"))
 	}
 
 	if excluded(event.WorkingDir, processor.Config.ExcludedPaths) {

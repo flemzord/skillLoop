@@ -201,6 +201,51 @@ func TestJobsAreIdempotentAndLeased(t *testing.T) {
 	}
 }
 
+func TestClaimJobTargetsOneIDAndPreservesStrictTransitions(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
+	store.now = func() time.Time { return now }
+
+	for _, id := range []string{"older-job", "current-job"} {
+		created, err := store.EnqueueJob(ctx, domain.Job{
+			ID:             id,
+			Kind:           "ingest",
+			IdempotencyKey: "hook:" + id,
+			Payload:        id,
+			AvailableAt:    now,
+		})
+		if err != nil || !created {
+			t.Fatalf("enqueue %s: created=%v err=%v", id, created, err)
+		}
+	}
+
+	claimed, ok, err := store.ClaimJob(ctx, "current-job", time.Minute)
+	if err != nil || !ok {
+		t.Fatalf("claim current job: ok=%v err=%v", ok, err)
+	}
+	if claimed.ID != "current-job" || claimed.Status != domain.JobProcessing || claimed.Attempts != 1 {
+		t.Fatalf("claimed job = %#v, want current processing job", claimed)
+	}
+	if _, ok, err := store.ClaimJob(ctx, "current-job", time.Minute); err != nil || ok {
+		t.Fatalf("reclaim live lease: ok=%v err=%v", ok, err)
+	}
+
+	older, ok, err := store.ClaimJob(ctx, "older-job", time.Minute)
+	if err != nil || !ok || older.ID != "older-job" {
+		t.Fatalf("claim untouched older job: job=%#v ok=%v err=%v", older, ok, err)
+	}
+	if err := store.CompleteJob(ctx, "current-job"); err != nil {
+		t.Fatalf("complete processing job: %v", err)
+	}
+	if err := store.CompleteJob(ctx, "current-job"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("complete already completed job error = %v, want ErrNotFound", err)
+	}
+	if err := store.RetryJob(ctx, "current-job", "late failure", now, true); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("retry completed job error = %v, want ErrNotFound", err)
+	}
+}
+
 func TestProposalEvaluationPromotionRollbackAndAudit(t *testing.T) {
 	store := openTestStore(t)
 	ctx := context.Background()
@@ -260,6 +305,11 @@ func TestProposalEvaluationPromotionRollbackAndAudit(t *testing.T) {
 	if err := store.RecordPromotion(ctx, promotion); err != nil {
 		t.Fatalf("record promotion: %v", err)
 	}
+	mismatchedPromotion := promotion
+	mismatchedPromotion.PromotedCommit = "other-candidate"
+	if err := store.RecordPromotion(ctx, mismatchedPromotion); err == nil {
+		t.Fatal("mismatched idempotent promotion unexpectedly succeeded")
+	}
 	active, err := store.ActivePromotion(ctx, skill.ID)
 	if err != nil || active.ID != promotion.ID || !active.Active {
 		t.Fatalf("active promotion = %#v err=%v", active, err)
@@ -294,6 +344,11 @@ func TestProposalEvaluationPromotionRollbackAndAudit(t *testing.T) {
 	if err := store.RecordRollback(ctx, rollback); err != nil {
 		t.Fatalf("record rollback idempotently: %v", err)
 	}
+	mismatchedRollback := rollback
+	mismatchedRollback.Reason = "different reason"
+	if err := store.RecordRollback(ctx, mismatchedRollback); err == nil {
+		t.Fatal("mismatched idempotent rollback unexpectedly succeeded")
+	}
 	if _, err := store.ActivePromotion(ctx, skill.ID); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("active promotion after rollback error = %v, want ErrNotFound", err)
 	}
@@ -310,7 +365,8 @@ func TestProposalEvaluationPromotionRollbackAndAudit(t *testing.T) {
 		t.Fatalf("append audit: entry=%#v err=%v", entry, err)
 	}
 	audit, err := store.ListAudit(ctx, "promotion", promotion.ID)
-	if err != nil || len(audit) != 1 || audit[0].ID != entry.ID {
+	if err != nil || len(audit) != 3 || audit[0].ID != entry.ID ||
+		audit[1].Action != "promotion.rolled_back" || audit[2].Action != "promotion.created" {
 		t.Fatalf("audit = %#v err=%v", audit, err)
 	}
 

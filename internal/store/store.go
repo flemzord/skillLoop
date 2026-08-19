@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -13,8 +14,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/flemzord/skillloop/internal/domain"
 	_ "modernc.org/sqlite"
+
+	"github.com/flemzord/skillloop/internal/domain"
 )
 
 var ErrNotFound = errors.New("store: not found")
@@ -113,7 +115,7 @@ func (s *Store) ListSkills(ctx context.Context) ([]domain.Skill, error) {
 	if err != nil {
 		return nil, fmt.Errorf("store: list skills: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var skills []domain.Skill
 	for rows.Next() {
@@ -131,6 +133,25 @@ func (s *Store) ListSkills(ctx context.Context) ([]domain.Skill, error) {
 		return nil, fmt.Errorf("store: iterate skills: %w", err)
 	}
 	return skills, nil
+}
+
+func (s *Store) Skill(ctx context.Context, id string) (domain.Skill, error) {
+	var skill domain.Skill
+	var enabled int
+	var createdAt int64
+	err := s.db.QueryRowContext(ctx, `
+		SELECT id, name, repository_path, instruction_path, enabled, created_at
+		FROM skills WHERE id = ?`, id,
+	).Scan(&skill.ID, &skill.Name, &skill.RepositoryPath, &skill.InstructionPath, &enabled, &createdAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.Skill{}, ErrNotFound
+	}
+	if err != nil {
+		return domain.Skill{}, fmt.Errorf("store: get skill: %w", err)
+	}
+	skill.Enabled = enabled != 0
+	skill.CreatedAt = fromUnixNano(createdAt)
+	return skill, nil
 }
 
 func (s *Store) RecordSession(ctx context.Context, session domain.Session) (bool, error) {
@@ -234,7 +255,7 @@ func (s *Store) ListLearningCards(ctx context.Context, skillID string) ([]domain
 	if err != nil {
 		return nil, fmt.Errorf("store: list learning cards: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var cards []domain.LearningCard
 	for rows.Next() {
@@ -266,7 +287,7 @@ func (s *Store) RebuildClusters(ctx context.Context, minimumSessions int) ([]dom
 	if err != nil {
 		return nil, fmt.Errorf("store: begin cluster rebuild: %w", err)
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	rows, err := tx.QueryContext(ctx, `
 		SELECT skill_id, kind, fingerprint, COUNT(*), COUNT(DISTINCT session_ref)
@@ -284,7 +305,7 @@ func (s *Store) RebuildClusters(ctx context.Context, minimumSessions int) ([]dom
 	for rows.Next() {
 		var group groupedCards
 		if err := rows.Scan(&group.skillID, &group.kind, &group.fingerprint, &group.cardCount, &group.sessionCount); err != nil {
-			rows.Close()
+			_ = rows.Close()
 			return nil, fmt.Errorf("store: scan grouped cards: %w", err)
 		}
 		groups = append(groups, group)
@@ -347,7 +368,7 @@ func (s *Store) ListClusters(ctx context.Context, minimumSessions int) ([]domain
 	if err != nil {
 		return nil, fmt.Errorf("store: list clusters: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var clusters []domain.Cluster
 	for rows.Next() {
@@ -361,6 +382,20 @@ func (s *Store) ListClusters(ctx context.Context, minimumSessions int) ([]domain
 		return nil, fmt.Errorf("store: iterate clusters: %w", err)
 	}
 	return clusters, nil
+}
+
+func (s *Store) Cluster(ctx context.Context, id string) (domain.Cluster, error) {
+	cluster, err := scanCluster(s.db.QueryRowContext(ctx, `
+		SELECT id, skill_id, kind, fingerprint, summary, lesson,
+		       card_count, session_count, status, updated_at
+		FROM clusters WHERE id = ?`, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.Cluster{}, ErrNotFound
+	}
+	if err != nil {
+		return domain.Cluster{}, err
+	}
+	return cluster, nil
 }
 
 func (s *Store) UpdateClusterStatus(ctx context.Context, id string, status domain.ClusterStatus) error {
@@ -405,6 +440,37 @@ func (s *Store) EnqueueJob(ctx context.Context, job domain.Job) (bool, error) {
 	return rowsChanged(result)
 }
 
+// ClaimJob leases exactly the requested job. It never substitutes another
+// queued item, which keeps a filesystem event causally tied to its durable job.
+// A processing job can only be reclaimed after its lease expires.
+func (s *Store) ClaimJob(ctx context.Context, id string, lease time.Duration) (domain.Job, bool, error) {
+	if id == "" || lease <= 0 {
+		return domain.Job{}, false, errors.New("store: job id and lease must be positive")
+	}
+	now := s.now()
+	row := s.db.QueryRowContext(ctx, `
+		UPDATE jobs
+		SET status = ?, attempts = attempts + 1, leased_until = ?, updated_at = ?
+		WHERE id = ?
+		  AND (
+			(status = ? AND available_at <= ?)
+			OR (status = ? AND leased_until <= ?)
+		  )
+		RETURNING id, kind, idempotency_key, payload, status, attempts,
+		          available_at, leased_until, last_error, created_at, updated_at`,
+		domain.JobProcessing, unixNano(now.Add(lease)), unixNano(now), id,
+		domain.JobQueued, unixNano(now), domain.JobProcessing, unixNano(now),
+	)
+	job, err := scanJob(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.Job{}, false, nil
+	}
+	if err != nil {
+		return domain.Job{}, false, fmt.Errorf("store: claim job %q: %w", id, err)
+	}
+	return job, true, nil
+}
+
 // ClaimJobs leases queued work and expired leases in one SQLite statement.
 func (s *Store) ClaimJobs(ctx context.Context, limit int, lease time.Duration) ([]domain.Job, error) {
 	if limit < 1 || lease <= 0 {
@@ -429,7 +495,7 @@ func (s *Store) ClaimJobs(ctx context.Context, limit int, lease time.Duration) (
 	if err != nil {
 		return nil, fmt.Errorf("store: claim jobs: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var jobs []domain.Job
 	for rows.Next() {
@@ -519,9 +585,109 @@ func (s *Store) SaveProposal(ctx context.Context, proposal domain.Proposal) erro
 	return nil
 }
 
+// ReserveProposal atomically claims an open cluster for one pending proposal.
+// A deterministic proposal ID makes this safe across multiple local processes.
+func (s *Store) ReserveProposal(ctx context.Context, proposal domain.Proposal) (bool, error) {
+	if proposal.ID == "" || proposal.ClusterID == "" || proposal.SkillID == "" || proposal.RepositoryPath == "" {
+		return false, errors.New("store: proposal id, cluster, skill, and repository path are required")
+	}
+	if proposal.Status != domain.ProposalPending {
+		return false, errors.New("store: reserved proposal must be pending")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("store: begin proposal reservation: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	claimed, err := tx.ExecContext(ctx, `
+		UPDATE clusters SET status = ?, updated_at = ?
+		WHERE id = ? AND skill_id = ? AND status = ?`,
+		domain.ClusterProposed, unixNano(s.now()), proposal.ClusterID, proposal.SkillID, domain.ClusterOpen,
+	)
+	if err != nil {
+		return false, fmt.Errorf("store: claim proposal cluster: %w", err)
+	}
+	changed, err := rowsChanged(claimed)
+	if err != nil {
+		return false, err
+	}
+	if !changed {
+		return false, nil
+	}
+	now := s.now()
+	createdAt := timeOrNow(proposal.CreatedAt, func() time.Time { return now })
+	inserted, err := tx.ExecContext(ctx, `
+		INSERT INTO proposals (
+			id, cluster_id, skill_id, status, repository_path, worktree_path,
+			branch, base_commit, candidate_commit, baseline_score, candidate_score,
+			previous_commit, promoted_commit, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, '', '', '', '', 0, 0, '', '', ?, ?)
+		ON CONFLICT(id) DO NOTHING`,
+		proposal.ID, proposal.ClusterID, proposal.SkillID, domain.ProposalPending,
+		proposal.RepositoryPath, unixNano(createdAt), unixNano(now),
+	)
+	if err != nil {
+		return false, fmt.Errorf("store: reserve proposal: %w", err)
+	}
+	created, err := rowsChanged(inserted)
+	if err != nil {
+		return false, err
+	}
+	if !created {
+		return false, nil
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("store: commit proposal reservation: %w", err)
+	}
+	return true, nil
+}
+
+func (s *Store) AbandonProposal(ctx context.Context, id string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("store: begin abandon proposal: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	var clusterID string
+	if err := tx.QueryRowContext(ctx,
+		`SELECT cluster_id FROM proposals WHERE id = ? AND status = ?`, id, domain.ProposalPending,
+	).Scan(&clusterID); errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	} else if err != nil {
+		return fmt.Errorf("store: find reserved proposal: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM proposals WHERE id = ? AND status = ?`, id, domain.ProposalPending); err != nil {
+		return fmt.Errorf("store: delete reserved proposal: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE clusters SET status = ?, updated_at = ? WHERE id = ? AND status = ?`,
+		domain.ClusterOpen, unixNano(s.now()), clusterID, domain.ClusterProposed,
+	); err != nil {
+		return fmt.Errorf("store: reopen proposal cluster: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("store: commit abandon proposal: %w", err)
+	}
+	return nil
+}
+
 func (s *Store) Proposal(ctx context.Context, id string) (domain.Proposal, error) {
 	row := s.db.QueryRowContext(ctx, proposalSelect+` WHERE id = ?`, id)
 	proposal, err := scanProposal(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.Proposal{}, ErrNotFound
+	}
+	if err != nil {
+		return domain.Proposal{}, err
+	}
+	return proposal, nil
+}
+
+func (s *Store) ProposalForCluster(ctx context.Context, clusterID string) (domain.Proposal, error) {
+	proposal, err := scanProposal(s.db.QueryRowContext(ctx,
+		proposalSelect+` WHERE cluster_id = ? ORDER BY created_at DESC, id LIMIT 1`, clusterID,
+	))
 	if errors.Is(err, sql.ErrNoRows) {
 		return domain.Proposal{}, ErrNotFound
 	}
@@ -546,7 +712,7 @@ func (s *Store) ListProposals(ctx context.Context, status domain.ProposalStatus)
 	if err != nil {
 		return nil, fmt.Errorf("store: list proposals: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var proposals []domain.Proposal
 	for rows.Next() {
@@ -609,7 +775,7 @@ func (s *Store) ListEvaluationResults(ctx context.Context, proposalID string) ([
 	if err != nil {
 		return nil, fmt.Errorf("store: list evaluation results: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var results []domain.EvaluationResult
 	for rows.Next() {
@@ -633,11 +799,170 @@ func (s *Store) ListEvaluationResults(ctx context.Context, proposalID string) ([
 	return results, nil
 }
 
+// CompleteEvaluation persists the exact baseline/candidate pair and transitions
+// the matching pending proposal in one transaction.
+func (s *Store) CompleteEvaluation(ctx context.Context, proposal domain.Proposal, results ...domain.EvaluationResult) error {
+	if proposal.ID == "" || proposal.BaseCommit == "" || proposal.CandidateCommit == "" || len(results) != 2 {
+		return errors.New("store: complete evaluation requires a proposal, exact commits, and two results")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("store: begin evaluation completion: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	seen := map[domain.EvaluationVariant]bool{}
+	for _, result := range results {
+		if result.ID == "" || result.ProposalID != proposal.ID || !validEvaluationVariant(result.Variant) || seen[result.Variant] {
+			return errors.New("store: evaluation results must contain unique baseline and candidate variants")
+		}
+		seen[result.Variant] = true
+		_, err := tx.ExecContext(ctx, `
+			INSERT INTO evaluation_results (
+				id, proposal_id, variant, passed, score, duration_ns, details, created_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(id) DO UPDATE SET
+				passed = excluded.passed,
+				score = excluded.score,
+				duration_ns = excluded.duration_ns,
+				details = excluded.details,
+				created_at = excluded.created_at`,
+			result.ID, result.ProposalID, result.Variant, boolInt(result.Passed), result.Score,
+			int64(result.Duration), result.Details, unixNano(timeOrNow(result.CreatedAt, s.now)),
+		)
+		if err != nil {
+			return fmt.Errorf("store: persist evaluation result: %w", err)
+		}
+	}
+	if !seen[domain.EvaluationBaseline] || !seen[domain.EvaluationCandidate] {
+		return errors.New("store: evaluation requires baseline and candidate variants")
+	}
+	updated, err := tx.ExecContext(ctx, `
+		UPDATE proposals SET status = ?, baseline_score = ?, candidate_score = ?, updated_at = ?
+		WHERE id = ? AND base_commit = ? AND candidate_commit = ?
+		  AND status IN (?, ?)`,
+		domain.ProposalEvaluated, proposal.BaselineScore, proposal.CandidateScore, unixNano(s.now()),
+		proposal.ID, proposal.BaseCommit, proposal.CandidateCommit,
+		domain.ProposalPending, domain.ProposalEvaluated,
+	)
+	if err != nil {
+		return fmt.Errorf("store: mark proposal evaluated: %w", err)
+	}
+	if err := expectChanged(updated); err != nil {
+		return fmt.Errorf("store: evaluation proposal drifted: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("store: commit evaluation: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) ApproveProposal(ctx context.Context, id, baseCommit, candidateCommit, actor, details string) error {
+	if actor == "" {
+		return errors.New("store: approval actor is required")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("store: begin proposal approval: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	var status domain.ProposalStatus
+	var storedBase, storedCandidate string
+	if err := tx.QueryRowContext(ctx,
+		`SELECT status, base_commit, candidate_commit FROM proposals WHERE id = ?`, id,
+	).Scan(&status, &storedBase, &storedCandidate); errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	} else if err != nil {
+		return fmt.Errorf("store: inspect proposal approval: %w", err)
+	}
+	if storedBase != baseCommit || storedCandidate != candidateCommit {
+		return errors.New("store: proposal approval commit drift")
+	}
+	if status == domain.ProposalApproved {
+		return nil
+	}
+	if status != domain.ProposalEvaluated {
+		return fmt.Errorf("store: cannot approve proposal in status %q", status)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE proposals SET status = ?, updated_at = ? WHERE id = ? AND status = ?`,
+		domain.ProposalApproved, unixNano(s.now()), id, domain.ProposalEvaluated,
+	); err != nil {
+		return fmt.Errorf("store: approve proposal: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO audit_log (action, entity_type, entity_id, actor, details, created_at)
+		VALUES ('proposal.approved', 'proposal', ?, ?, ?, ?)`,
+		id, actor, details, unixNano(s.now()),
+	); err != nil {
+		return fmt.Errorf("store: audit proposal approval: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("store: commit proposal approval: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) RejectProposal(ctx context.Context, id, actor, details string) error {
+	if actor == "" {
+		return errors.New("store: rejection actor is required")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("store: begin proposal rejection: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	var clusterID string
+	var status domain.ProposalStatus
+	if err := tx.QueryRowContext(ctx,
+		`SELECT cluster_id, status FROM proposals WHERE id = ?`, id,
+	).Scan(&clusterID, &status); errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	} else if err != nil {
+		return fmt.Errorf("store: inspect proposal rejection: %w", err)
+	}
+	if status == domain.ProposalRejected {
+		return nil
+	}
+	if status != domain.ProposalPending && status != domain.ProposalEvaluated && status != domain.ProposalApproved {
+		return fmt.Errorf("store: cannot reject proposal in status %q", status)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE proposals SET status = ?, updated_at = ? WHERE id = ?`,
+		domain.ProposalRejected, unixNano(s.now()), id,
+	); err != nil {
+		return fmt.Errorf("store: reject proposal: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE clusters SET status = ?, updated_at = ? WHERE id = ?`,
+		domain.ClusterResolved, unixNano(s.now()), clusterID,
+	); err != nil {
+		return fmt.Errorf("store: resolve rejected proposal cluster: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO audit_log (action, entity_type, entity_id, actor, details, created_at)
+		VALUES ('proposal.rejected', 'proposal', ?, ?, ?, ?)`,
+		id, actor, details, unixNano(s.now()),
+	); err != nil {
+		return fmt.Errorf("store: audit proposal rejection: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("store: commit proposal rejection: %w", err)
+	}
+	return nil
+}
+
 // RecordPromotion atomically deactivates the previous release for a skill and
 // marks the corresponding proposal promoted.
 func (s *Store) RecordPromotion(ctx context.Context, promotion domain.Promotion) error {
+	return s.RecordPromotionDecision(ctx, promotion, "system", "")
+}
+
+func (s *Store) RecordPromotionDecision(ctx context.Context, promotion domain.Promotion, actor, details string) error {
 	if promotion.ID == "" || promotion.ProposalID == "" || promotion.SkillID == "" || promotion.PromotedCommit == "" {
 		return errors.New("store: promotion id, proposal, skill, and promoted commit are required")
+	}
+	if actor == "" {
+		return errors.New("store: promotion actor is required")
 	}
 	if promotion.MonitorStatus == "" {
 		promotion.MonitorStatus = domain.MonitorPending
@@ -649,7 +974,35 @@ func (s *Store) RecordPromotion(ctx context.Context, promotion domain.Promotion)
 	if err != nil {
 		return fmt.Errorf("store: begin promotion: %w", err)
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
+
+	existing, existingErr := scanPromotion(tx.QueryRowContext(ctx, promotionSelect+` WHERE id = ?`, promotion.ID))
+	if existingErr == nil {
+		if existing.ProposalID != promotion.ProposalID || existing.SkillID != promotion.SkillID ||
+			existing.PreviousCommit != promotion.PreviousCommit || existing.PromotedCommit != promotion.PromotedCommit || !existing.Active {
+			return errors.New("store: promotion id already has different payload or is inactive")
+		}
+		return nil
+	}
+	if !errors.Is(existingErr, sql.ErrNoRows) {
+		return existingErr
+	}
+	var proposalSkill, baseCommit, candidateCommit string
+	var proposalStatus domain.ProposalStatus
+	if err := tx.QueryRowContext(ctx, `
+		SELECT skill_id, status, base_commit, candidate_commit
+		FROM proposals WHERE id = ?`, promotion.ProposalID,
+	).Scan(&proposalSkill, &proposalStatus, &baseCommit, &candidateCommit); errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	} else if err != nil {
+		return fmt.Errorf("store: inspect promotion proposal: %w", err)
+	}
+	if proposalSkill != promotion.SkillID || baseCommit != promotion.PreviousCommit || candidateCommit != promotion.PromotedCommit {
+		return errors.New("store: promotion does not match exact proposal revisions")
+	}
+	if proposalStatus != domain.ProposalEvaluated && proposalStatus != domain.ProposalApproved {
+		return fmt.Errorf("store: cannot promote proposal in status %q", proposalStatus)
+	}
 
 	if _, err := tx.ExecContext(ctx, `UPDATE promotions SET active = 0 WHERE skill_id = ?`, promotion.SkillID); err != nil {
 		return fmt.Errorf("store: deactivate previous promotion: %w", err)
@@ -660,23 +1013,33 @@ func (s *Store) RecordPromotion(ctx context.Context, promotion domain.Promotion)
 		INSERT INTO promotions (
 			id, proposal_id, skill_id, previous_commit, promoted_commit,
 			active, monitor_status, promoted_at, last_monitored_at
-		) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)
-		ON CONFLICT(id) DO UPDATE SET
-			active = 1,
-			monitor_status = excluded.monitor_status,
-			last_monitored_at = excluded.last_monitored_at`,
+		) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)`,
 		promotion.ID, promotion.ProposalID, promotion.SkillID, promotion.PreviousCommit,
 		promotion.PromotedCommit, promotion.MonitorStatus, unixNano(promotedAt), lastMonitoredAt,
 	); err != nil {
 		return fmt.Errorf("store: insert promotion: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, `
+	updated, err := tx.ExecContext(ctx, `
 		UPDATE proposals SET status = ?, promoted_commit = ?, previous_commit = ?, updated_at = ?
-		WHERE id = ?`,
+		WHERE id = ? AND skill_id = ? AND base_commit = ? AND candidate_commit = ?
+		  AND status IN (?, ?)`,
 		domain.ProposalPromoted, promotion.PromotedCommit, promotion.PreviousCommit,
-		unixNano(s.now()), promotion.ProposalID,
-	); err != nil {
+		unixNano(s.now()), promotion.ProposalID, promotion.SkillID,
+		promotion.PreviousCommit, promotion.PromotedCommit,
+		domain.ProposalEvaluated, domain.ProposalApproved,
+	)
+	if err != nil {
 		return fmt.Errorf("store: mark proposal promoted: %w", err)
+	}
+	if err := expectChanged(updated); err != nil {
+		return fmt.Errorf("store: promotion proposal drifted: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO audit_log (action, entity_type, entity_id, actor, details, created_at)
+		VALUES ('promotion.created', 'promotion', ?, ?, ?, ?)`,
+		promotion.ID, actor, details, unixNano(s.now()),
+	); err != nil {
+		return fmt.Errorf("store: audit promotion: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("store: commit promotion: %w", err)
@@ -718,7 +1081,7 @@ func (s *Store) ListPromotions(ctx context.Context, activeOnly bool) ([]domain.P
 	if err != nil {
 		return nil, fmt.Errorf("store: list promotions: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var promotions []domain.Promotion
 	for rows.Next() {
@@ -758,7 +1121,7 @@ func (s *Store) RecordRollback(ctx context.Context, rollback domain.Rollback) er
 	if err != nil {
 		return fmt.Errorf("store: begin rollback: %w", err)
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	createdAt := timeOrNow(rollback.CreatedAt, s.now)
 	inserted, err := tx.ExecContext(ctx, `
@@ -777,6 +1140,21 @@ func (s *Store) RecordRollback(ctx context.Context, rollback domain.Rollback) er
 		return err
 	}
 	if !created {
+		var existing domain.Rollback
+		var existingCreatedAt int64
+		if err := tx.QueryRowContext(ctx, `
+			SELECT id, promotion_id, from_commit, to_commit, reason, actor, created_at
+			FROM rollbacks WHERE id = ?`, rollback.ID,
+		).Scan(
+			&existing.ID, &existing.PromotionID, &existing.FromCommit, &existing.ToCommit,
+			&existing.Reason, &existing.Actor, &existingCreatedAt,
+		); err != nil {
+			return fmt.Errorf("store: inspect existing rollback: %w", err)
+		}
+		if existing.PromotionID != rollback.PromotionID || existing.FromCommit != rollback.FromCommit ||
+			existing.ToCommit != rollback.ToCommit || existing.Reason != rollback.Reason || existing.Actor != rollback.Actor {
+			return errors.New("store: rollback id already has different payload")
+		}
 		if err := tx.Commit(); err != nil {
 			return fmt.Errorf("store: commit existing rollback: %w", err)
 		}
@@ -803,6 +1181,21 @@ func (s *Store) RecordRollback(ctx context.Context, rollback domain.Rollback) er
 	); err != nil {
 		return fmt.Errorf("store: mark proposal rolled back: %w", err)
 	}
+	auditDetails, err := json.Marshal(map[string]string{
+		"from_commit": rollback.FromCommit,
+		"to_commit":   rollback.ToCommit,
+		"reason":      rollback.Reason,
+	})
+	if err != nil {
+		return fmt.Errorf("store: encode rollback audit: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO audit_log (action, entity_type, entity_id, actor, details, created_at)
+		VALUES ('promotion.rolled_back', 'promotion', ?, ?, ?, ?)`,
+		rollback.PromotionID, rollback.Actor, string(auditDetails), unixNano(createdAt),
+	); err != nil {
+		return fmt.Errorf("store: audit rollback: %w", err)
+	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("store: commit rollback: %w", err)
 	}
@@ -823,7 +1216,7 @@ func (s *Store) ListRollbacks(ctx context.Context, promotionID string) ([]domain
 	if err != nil {
 		return nil, fmt.Errorf("store: list rollbacks: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var rollbacks []domain.Rollback
 	for rows.Next() {
@@ -876,7 +1269,7 @@ func (s *Store) ListAudit(ctx context.Context, entityType, entityID string) ([]d
 	if err != nil {
 		return nil, fmt.Errorf("store: list audit: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var entries []domain.AuditEntry
 	for rows.Next() {
@@ -1026,7 +1419,7 @@ func countStatuses(ctx context.Context, db *sql.DB, query string, set func(strin
 	if err != nil {
 		return fmt.Errorf("store: count statuses: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	for rows.Next() {
 		var status string
 		var count int

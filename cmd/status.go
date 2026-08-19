@@ -5,9 +5,10 @@ import (
 	"fmt"
 	"os/exec"
 
+	"github.com/spf13/cobra"
+
 	"github.com/flemzord/skillloop/internal/config"
 	"github.com/flemzord/skillloop/internal/domain"
-	"github.com/spf13/cobra"
 )
 
 func newStatusCommand(options *rootOptions) *cobra.Command {
