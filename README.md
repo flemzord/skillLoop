@@ -15,7 +15,7 @@ It does **not** train a model and it never edits a live skill in place. A fast l
 Agent skills are usually improved from memory after something goes wrong. SkillLoop makes that feedback loop explicit:
 
 - learn from repeated sessions instead of a single anecdote;
-- attribute corrections, tool failures, recoveries, and validation steps to a registered skill;
+- attribute a lesson only when a successful, correlated provider tool result loaded the registered skill or read its exact registered `SKILL.md` path;
 - produce the smallest possible change to `SKILL.md` in an isolated Git worktree;
 - evaluate the exact baseline and candidate commits;
 - keep promotion separate from the source checkout;
@@ -49,19 +49,20 @@ The storage responsibilities are deliberately separate:
 | Learning state | `$data_dir/skillloop.db` | SQLite stores session locators and outcomes, cards, clusters, jobs, proposals, evaluations, promotions, rollbacks, and an audit log. |
 | Source transcripts | Codex or Claude's original path | Read in place. Transcript bodies are not copied into SQLite or the spool. |
 | Candidate changes | `$data_dir/worktrees` | Created on a dedicated `skillloop/...` branch without staging, resetting, or cleaning the source checkout. |
-| Promoted versions | `$data_dir/releases/<skill-id>` | Read-only snapshots selected by atomic `current` and `previous` symlinks. |
+| Promoted versions | `$data_dir/releases/<skill-id>` | Read-only snapshots selected by a serialized, crash-recoverable `current` / `previous` link pair. |
 
 ## Safety and privacy properties
 
 - **Local-first:** v0.1.0 makes no network call in the capture, analysis, evaluation, promotion, or rollback pipeline. An external evaluator runs only when you configure one.
 - **Fail-open hooks:** hook errors are intentionally swallowed so SkillLoop cannot block Codex or Claude Code. Hook input is limited to 1 MiB, written atomically, and the installed command has a one-second timeout.
 - **Private state:** configuration and spool files use `0600`; local state directories use `0700`; SQLite uses WAL, foreign keys, and a single local writer.
-- **No transcript duplication:** only the transcript locator and sanitized learning artifacts are retained. Raw transcript content stays with the originating tool.
-- **Redacted learning cards:** known token patterns, email addresses, home-directory usernames, and URL query strings are removed before facts are stored. Paths and transcript locators in session metadata are not anonymized.
-- **Owned skills only:** a skill must be an explicitly registered Git repository with a tracked, regular, non-symlink `SKILL.md`.
-- **Bounded candidates:** a candidate may change only that `SKILL.md`, is limited to a 4 KiB / 30-line diff, is checked for secret patterns, and must apply idempotently. Secrets are rejected; security/permission guidance and prompt-injection markers force human approval and are never eligible for autopilot.
+- **No transcript duplication:** only the transcript locator and sanitized learning artifacts are retained. Raw transcript content stays with the originating tool; ingestion is restricted to the provider's configured transcript root and is capped at 64 MiB, 100,000 records, and 20,000 retained messages.
+- **Redacted learning cards:** known token patterns, email addresses, home-directory usernames, and URL query strings are removed before facts are stored. The persistence boundary also sanitizes card summaries and lessons; a fingerprint containing a secret is rejected instead of being stored. Paths and transcript locators in session metadata are not anonymized.
+- **Owned skills only:** a skill must be an explicitly registered Git repository with a tracked, regular, non-symlink `SKILL.md` no larger than 8 MiB.
+- **Bounded candidates:** a candidate may change only that `SKILL.md`, is limited to a 4 KiB / 30-line diff, is checked for secret patterns, and must apply idempotently. Candidate worktrees are preflighted to at most 100,000 files and 1 GiB of raw Git blobs; Git filters are disabled while candidate worktrees and Git content are read. Secrets are rejected; security/permission guidance and prompt-injection markers force human approval and are never eligible for autopilot.
 - **Revision binding:** evaluation and approval identify the exact baseline and candidate commits. Git drift invalidates promotion.
-- **Reversible promotion:** promotion does not edit the source checkout's files or index. It pins the approved commits under SkillLoop-owned Git refs, then uses immutable releases and atomic symlinks as the rollback boundary.
+- **Bounded evaluation:** the external evaluator is run in a separate process group with capped output and a timeout that terminates the full group, including descendants.
+- **Reversible promotion:** promotion does not edit the source checkout's files or index. It pins the approved commits under SkillLoop-owned Git refs, then uses immutable releases as the rollback boundary. Release transitions are serialized across processes with `flock`, journaled for crash recovery, and `current` is authenticated against its pinned Git revision before use.
 - **Loop prevention:** add a `.skillloop-ignore` file to a directory, or configure `excluded_paths`, to exclude SkillLoop's own work and any other subtree.
 
 Operational metadata is pruned on each daemon drain. By default, transcript locators are cleared after 30 days, failed spool events and completed jobs after 7 days, and failed jobs after 30 days. The source transcript itself is never deleted. Learning cards, clusters, proposals, releases, rollbacks, and audit entries remain durable; pending/evaluated candidate worktrees remain reviewable until promotion or rejection cleans them up. Set an individual retention duration to `0s` to keep that operational category indefinitely.
@@ -224,7 +225,7 @@ Monitoring re-evaluates each active promotion. A completed regression rolls back
 skillloop rollback <skill-id> --reason "observed regression"
 ```
 
-Promotion writes a read-only release under the SkillLoop data directory. When a managed installation points Codex or Claude at the stable `current` symlink, future promotions and rollbacks take effect atomically without editing an agent cache or the registered source checkout.
+Promotion writes a read-only release under the SkillLoop data directory. A release contains only the registered `SKILL.md` and its `scripts/` or `assets/` subtree, bounded to a 64 MiB archive, 10,000 members, 8 MiB per member, and 32 MiB of files. When a managed installation points Codex or Claude at the stable, authenticated `current` symlink, future promotions and rollbacks take effect through a serialized, crash-recoverable release transition without editing an agent cache or the registered source checkout.
 
 ## Autonomy modes
 
@@ -236,7 +237,7 @@ Promotion writes a read-only release under the SkillLoop data directory. When a 
 
 `skillloop init` defaults to `propose`; use `skillloop init --mode observe` for collection only. `skillloop mode get` prints the current mode and `skillloop mode set <mode>` changes it after validating the full configuration.
 
-Autopilot is intentionally not enabled by `skillloop init --mode autopilot` alone. Initialize in `propose`, configure `evaluation.allow_autopilot: true` and a non-empty `evaluation.command`, then run `skillloop mode set autopilot`. The command is an argument vector, not a shell string. It runs once in an exact baseline worktree and once in the candidate worktree; the baseline must fail and the candidate must pass.
+Autopilot is intentionally not enabled by `skillloop init --mode autopilot` alone. Initialize in `propose`, configure `evaluation.allow_autopilot: true` and a non-empty `evaluation.command`, then run `skillloop mode set autopilot`. The command is an argument vector, not a shell string. It runs once in an exact baseline worktree and once in the candidate worktree; the baseline must fail and the candidate must pass. Only a safe `CardValidation` lesson can be eligible for autopilot; correction and failure lessons always require human approval.
 
 ## Supported session formats
 
@@ -253,7 +254,7 @@ skillloop hooks uninstall codex
 skillloop hooks uninstall claude
 ```
 
-Malformed JSONL records are skipped because a hook can observe an append-only transcript while its final line is incomplete. A captured event with a missing or unreadable transcript is moved to the failed spool instead of stopping other jobs.
+Malformed JSONL records are skipped because a hook can observe an append-only transcript while its final line is incomplete. Transcript paths are resolved beneath the provider-specific root without following symlinks or reading non-regular files. A captured event with a missing, unreadable, or over-limit transcript is moved to the failed spool instead of stopping other jobs.
 
 ## Configuration
 
@@ -351,7 +352,7 @@ CI evaluates the Nix flake, runs formatting/lint/tests/build/audit checks, tests
 ## v0.1.0 limitations
 
 - Learning extraction is deterministic and heuristic. It recognizes explicit English/French correction markers, failed tool results, recoveries, and a bounded set of successful validation commands; it does not call a model.
-- Skill attribution requires an unambiguous mention of the registered skill name or instruction path in normalized session messages.
+- Skill attribution requires a successful, correlated provider tool result that loaded the registered skill or read its exact registered `SKILL.md`; text-only mentions are not attribution evidence.
 - Recurrence uses exact sanitized fingerprints rather than semantic similarity.
 - Only a tracked file named `SKILL.md` is eligible for candidate generation. v0.1.0 does not patch scripts, fixtures, examples, or multiple files.
 - Candidates add or replace a small SkillLoop-managed guidance block; there is no free-form model-generated rewrite.
