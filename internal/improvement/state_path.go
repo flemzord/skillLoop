@@ -53,7 +53,7 @@ func (directory *stateDirectory) verifyIdentity() error {
 		if err := unix.Fstatat(anchor.parentFD, anchor.name, &stat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
 			return fmt.Errorf("verify state path identity: %w", errors.Join(err, ErrUnsafePath))
 		}
-		if uint64(stat.Dev) != anchor.device || stat.Ino != anchor.inode || stat.Mode&unix.S_IFMT != unix.S_IFDIR {
+		if stateDevice(&stat) != anchor.device || stat.Ino != anchor.inode || stat.Mode&unix.S_IFMT != unix.S_IFDIR {
 			return fmt.Errorf("state path identity changed at %q: %w", anchor.name, ErrDrift)
 		}
 	}
@@ -76,7 +76,7 @@ func verifyStateChildIdentity(parent *stateDirectory, name string, child *os.Fil
 	if err := unix.Fstat(int(child.Fd()), &opened); err != nil {
 		return fmt.Errorf("verify opened state child: %w", err)
 	}
-	if uint64(named.Dev) != uint64(opened.Dev) || named.Ino != opened.Ino || named.Mode&unix.S_IFMT != unix.S_IFDIR {
+	if stateDevice(&named) != stateDevice(&opened) || named.Ino != opened.Ino || named.Mode&unix.S_IFMT != unix.S_IFDIR {
 		return fmt.Errorf("state child identity changed at %q: %w", name, ErrDrift)
 	}
 	return nil
@@ -142,7 +142,7 @@ func openStateDirectory(stateDir string, components ...string) (*stateDirectory,
 			closeTraversal()
 			return nil, fmt.Errorf("inspect state directory component %q: %w", component, statErr)
 		}
-		anchors = append(anchors, statePathAnchor{parentFD: current, name: component, device: uint64(stat.Dev), inode: stat.Ino})
+		anchors = append(anchors, statePathAnchor{parentFD: current, name: component, device: stateDevice(&stat), inode: stat.Ino})
 		current = next
 		if index >= logicalRootIndex {
 			if chmodErr := unix.Fchmod(current, 0o700); chmodErr != nil {
