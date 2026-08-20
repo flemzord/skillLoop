@@ -17,6 +17,7 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/flemzord/skillloop/internal/domain"
+	"github.com/flemzord/skillloop/internal/sanitize"
 )
 
 var ErrNotFound = errors.New("store: not found")
@@ -298,12 +299,21 @@ func (s *Store) AddLearningCard(ctx context.Context, card domain.LearningCard) (
 	if card.ID == "" || card.SessionRef == "" || card.SkillID == "" || card.Fingerprint == "" {
 		return false, errors.New("store: card id, session, skill, and fingerprint are required")
 	}
+	if sanitize.ContainsSecret(card.Fingerprint) {
+		return false, errors.New("store: card fingerprint contains a secret")
+	}
 	if !validCardKind(card.Kind) {
 		return false, fmt.Errorf("store: invalid card kind %q", card.Kind)
 	}
 	if card.Confidence < 0 || card.Confidence > 1 {
 		return false, errors.New("store: card confidence must be between 0 and 1")
 	}
+	// Summary and lesson originate in lower-trust transcript content. Enforce
+	// the durable redaction boundary here as well as in the analyzer so direct
+	// callers cannot bypass it. Fingerprints define idempotency and quorum, so
+	// secret-bearing identities are rejected instead of rewritten.
+	card.Summary = sanitize.Text(card.Summary)
+	card.Lesson = sanitize.Text(card.Lesson)
 	result, err := s.db.ExecContext(ctx, `
 		INSERT INTO learning_cards (
 			id, session_ref, skill_id, kind, fingerprint, summary, lesson, confidence, created_at
@@ -648,16 +658,30 @@ func (s *Store) SaveProposal(ctx context.Context, proposal domain.Proposal) erro
 	if !validProposalStatus(proposal.Status) {
 		return fmt.Errorf("store: invalid proposal status %q", proposal.Status)
 	}
+	if proposal.BaseCommit != "" || proposal.CandidateCommit != "" {
+		if proposal.BaseCommit == "" || proposal.CandidateCommit == "" || proposal.Fingerprint == "" ||
+			proposal.Lesson == "" || !validCardKind(proposal.CardKind) {
+			return errors.New("store: prepared proposal requires exact commits and candidate safety metadata")
+		}
+		if (proposal.CardKind == domain.CardCorrection || proposal.CardKind == domain.CardFailure) && !proposal.RequiresHumanApproval {
+			return errors.New("store: correction and failure proposals require human approval")
+		}
+	}
 	now := s.now()
 	createdAt := timeOrNow(proposal.CreatedAt, func() time.Time { return now })
 	updatedAt := timeOrNow(proposal.UpdatedAt, func() time.Time { return now })
-	_, err := s.db.ExecContext(ctx, `
+	result, err := s.db.ExecContext(ctx, `
 		INSERT INTO proposals (
-			id, cluster_id, skill_id, status, repository_path, worktree_path,
+			id, cluster_id, skill_id, fingerprint, lesson, card_kind, requires_human_approval,
+			status, repository_path, worktree_path,
 			branch, base_commit, candidate_commit, baseline_score, candidate_score,
 			previous_commit, promoted_commit, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
+			fingerprint = excluded.fingerprint,
+			lesson = excluded.lesson,
+			card_kind = excluded.card_kind,
+			requires_human_approval = excluded.requires_human_approval,
 			status = excluded.status,
 			worktree_path = excluded.worktree_path,
 			branch = excluded.branch,
@@ -667,8 +691,23 @@ func (s *Store) SaveProposal(ctx context.Context, proposal domain.Proposal) erro
 			candidate_score = excluded.candidate_score,
 			previous_commit = excluded.previous_commit,
 			promoted_commit = excluded.promoted_commit,
-			updated_at = excluded.updated_at`,
-		proposal.ID, proposal.ClusterID, proposal.SkillID, proposal.Status,
+			updated_at = excluded.updated_at
+		WHERE proposals.cluster_id = excluded.cluster_id
+		  AND proposals.skill_id = excluded.skill_id
+		  AND proposals.repository_path = excluded.repository_path
+		  AND (
+			(proposals.base_commit = '' AND proposals.candidate_commit = '')
+			OR (
+				proposals.base_commit = excluded.base_commit
+				AND proposals.candidate_commit = excluded.candidate_commit
+				AND proposals.fingerprint = excluded.fingerprint
+				AND proposals.lesson = excluded.lesson
+				AND proposals.card_kind = excluded.card_kind
+				AND proposals.requires_human_approval = excluded.requires_human_approval
+			)
+		  )`,
+		proposal.ID, proposal.ClusterID, proposal.SkillID, proposal.Fingerprint,
+		proposal.Lesson, proposal.CardKind, boolInt(proposal.RequiresHumanApproval), proposal.Status,
 		proposal.RepositoryPath, proposal.WorktreePath, proposal.Branch,
 		proposal.BaseCommit, proposal.CandidateCommit, proposal.BaselineScore,
 		proposal.CandidateScore, proposal.PreviousCommit, proposal.PromotedCommit,
@@ -676,6 +715,9 @@ func (s *Store) SaveProposal(ctx context.Context, proposal domain.Proposal) erro
 	)
 	if err != nil {
 		return fmt.Errorf("store: save proposal: %w", err)
+	}
+	if err := expectChanged(result); err != nil {
+		return fmt.Errorf("store: proposal identity or candidate metadata drifted: %w", err)
 	}
 	return nil
 }
@@ -765,6 +807,43 @@ func (s *Store) AbandonProposal(ctx context.Context, id string) error {
 		return fmt.Errorf("store: commit abandon proposal: %w", err)
 	}
 	return nil
+}
+
+// AbandonProposalIfUnchanged abandons only the exact empty reservation
+// observed by the caller. A concurrently refreshed or populated proposal is
+// preserved, preventing stale daemon snapshots from deleting live work.
+func (s *Store) AbandonProposalIfUnchanged(ctx context.Context, id string, observedUpdatedAt time.Time) (bool, error) {
+	if id == "" || observedUpdatedAt.IsZero() {
+		return false, errors.New("store: proposal id and observed update time are required")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("store: begin compare-and-swap abandon proposal: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	var clusterID string
+	err = tx.QueryRowContext(ctx, `
+		DELETE FROM proposals
+		WHERE id = ? AND status = ? AND base_commit = '' AND candidate_commit = '' AND updated_at = ?
+		RETURNING cluster_id`,
+		id, domain.ProposalPending, unixNano(observedUpdatedAt),
+	).Scan(&clusterID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("store: compare-and-swap abandon proposal: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE clusters SET status = ?, updated_at = ? WHERE id = ? AND status = ?`,
+		domain.ClusterOpen, unixNano(s.now()), clusterID, domain.ClusterProposed,
+	); err != nil {
+		return false, fmt.Errorf("store: reopen abandoned proposal cluster: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("store: commit compare-and-swap abandon proposal: %w", err)
+	}
+	return true, nil
 }
 
 func (s *Store) Proposal(ctx context.Context, id string) (domain.Proposal, error) {
@@ -1425,7 +1504,8 @@ func (s *Store) Counts(ctx context.Context, eligibleMinimumSessions int) (Counts
 }
 
 const proposalSelect = `
-	SELECT id, cluster_id, skill_id, status, repository_path, worktree_path,
+	SELECT id, cluster_id, skill_id, fingerprint, lesson, card_kind, requires_human_approval,
+	       status, repository_path, worktree_path,
 	       branch, base_commit, candidate_commit, baseline_score, candidate_score,
 	       previous_commit, promoted_commit, created_at, updated_at
 	FROM proposals`
@@ -1455,9 +1535,11 @@ func scanCluster(row scanner) (domain.Cluster, error) {
 
 func scanProposal(row scanner) (domain.Proposal, error) {
 	var proposal domain.Proposal
+	var requiresHumanApproval int
 	var createdAt, updatedAt int64
 	if err := row.Scan(
-		&proposal.ID, &proposal.ClusterID, &proposal.SkillID, &proposal.Status,
+		&proposal.ID, &proposal.ClusterID, &proposal.SkillID, &proposal.Fingerprint,
+		&proposal.Lesson, &proposal.CardKind, &requiresHumanApproval, &proposal.Status,
 		&proposal.RepositoryPath, &proposal.WorktreePath, &proposal.Branch,
 		&proposal.BaseCommit, &proposal.CandidateCommit, &proposal.BaselineScore,
 		&proposal.CandidateScore, &proposal.PreviousCommit, &proposal.PromotedCommit,
@@ -1467,6 +1549,7 @@ func scanProposal(row scanner) (domain.Proposal, error) {
 	}
 	proposal.CreatedAt = fromUnixNano(createdAt)
 	proposal.UpdatedAt = fromUnixNano(updatedAt)
+	proposal.RequiresHumanApproval = requiresHumanApproval != 0
 	return proposal, nil
 }
 

@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bytes"
+	"encoding/json"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -115,6 +116,45 @@ func TestProposalShowOutputIncludesCandidateDiff(t *testing.T) {
 		if !strings.Contains(output.String(), expected) {
 			t.Fatalf("show output does not contain %q: %q", expected, output.String())
 		}
+	}
+}
+
+func TestProposalHumanOutputEscapesTerminalControlsButJSONStaysExact(t *testing.T) {
+	diff := "diff --git a/SKILL.md b/SKILL.md\n+safe\tcolumn\n+\x1b[2Jforged\rstatus\n+\u202efilename"
+	auditDetails := "{\"message\":\"\x1b[31mforged\rstatus\"}"
+	view := pipeline.ProposalView{
+		Proposal: domain.Proposal{ID: "proposal-1"},
+		Diff:     diff,
+		Audit: []domain.AuditEntry{{
+			Action: "proposal.evaluated", Actor: "pipeline", Details: auditDetails,
+		}},
+	}
+
+	output := bytes.NewBuffer(nil)
+	if err := writeProposalView(output, view); err != nil {
+		t.Fatalf("write human proposal: %v", err)
+	}
+	for _, forbidden := range []string{"\x1b", "\r", "\u202e"} {
+		if strings.Contains(output.String(), forbidden) {
+			t.Fatalf("human output retained terminal control %q: %q", forbidden, output.String())
+		}
+	}
+	for _, visible := range []string{`\x1b[2J`, `\x0dstatus`, `\u202efilename`, "safe\tcolumn"} {
+		if !strings.Contains(output.String(), visible) {
+			t.Fatalf("human output missing visible encoding %q: %q", visible, output.String())
+		}
+	}
+
+	encoded, err := json.Marshal(view)
+	if err != nil {
+		t.Fatalf("marshal JSON proposal: %v", err)
+	}
+	var decoded pipeline.ProposalView
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatalf("unmarshal JSON proposal: %v", err)
+	}
+	if decoded.Diff != diff || len(decoded.Audit) != 1 || decoded.Audit[0].Details != auditDetails {
+		t.Fatalf("JSON changed original controls: %#v", decoded)
 	}
 }
 

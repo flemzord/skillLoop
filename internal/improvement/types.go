@@ -7,17 +7,30 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/flemzord/skillloop/internal/domain"
 )
 
 const (
 	defaultRunnerTimeout = 30 * time.Second
 	defaultOutputLimit   = 64 * 1024
+	runnerWaitDelay      = time.Second
+
+	maxWorktreeFiles  = 100_000
+	maxWorktreeBytes  = 1024 * 1024 * 1024
+	maxSkillFileBytes = 8 * 1024 * 1024
+
+	maxReleaseArchiveBytes = 64 * 1024 * 1024
+	maxReleaseMembers      = 10_000
+	maxReleaseMemberBytes  = maxSkillFileBytes
+	maxReleaseTotalBytes   = 32 * 1024 * 1024
 )
 
 var (
 	ErrUnsafePath                 = errors.New("unsafe skill path")
 	ErrUnsafeChange               = errors.New("security-sensitive skill change")
 	ErrDiffLimit                  = errors.New("candidate diff exceeds limits")
+	ErrResourceLimit              = errors.New("resource limit exceeded")
 	ErrDrift                      = errors.New("git revision drift")
 	ErrEvaluationFailed           = errors.New("candidate did not pass evaluation")
 	ErrExternalEvaluationRequired = errors.New("external baseline/candidate evaluation is required for promotion")
@@ -46,6 +59,7 @@ type Candidate struct {
 	ClusterID             string
 	Fingerprint           string
 	Lesson                string
+	CardKind              domain.CardKind
 	RepositoryPath        string
 	InstructionPath       string
 	WorktreePath          string

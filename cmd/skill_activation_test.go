@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -14,13 +15,11 @@ import (
 	"github.com/flemzord/skillloop/internal/store"
 )
 
-const activationTestRevision = "0123456789abcdef0123456789abcdef01234567"
-
 func TestSkillInstallAndUninstallCommandsUseConfiguredReleaseAndUserHome(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	configPath, dataDir, skill := prepareActivationCommand(t)
-	current := makeActivationRelease(t, dataDir, skill.ID)
+	current := makeActivationRelease(t, dataDir, skill)
 
 	installOutput := bytes.NewBuffer(nil)
 	install := NewRootCommand()
@@ -88,10 +87,19 @@ func prepareActivationCommand(t *testing.T) (string, string, domain.Skill) {
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
+	repository := t.TempDir()
+	runActivationCommandGit(t, repository, "init", "-b", "main")
+	runActivationCommandGit(t, repository, "config", "user.name", "Test User")
+	runActivationCommandGit(t, repository, "config", "user.email", "test@example.invalid")
+	if err := os.WriteFile(filepath.Join(repository, "SKILL.md"), []byte("# Demo\n"), 0o644); err != nil {
+		t.Fatalf("write repository skill: %v", err)
+	}
+	runActivationCommandGit(t, repository, "add", "SKILL.md")
+	runActivationCommandGit(t, repository, "commit", "-m", "feat: add demo skill")
 	skill := domain.Skill{
 		ID:              "skill-demo",
 		Name:            "Demo Skill",
-		RepositoryPath:  t.TempDir(),
+		RepositoryPath:  repository,
 		InstructionPath: "SKILL.md",
 		Enabled:         true,
 		CreatedAt:       time.Now().UTC(),
@@ -111,10 +119,11 @@ func prepareActivationCommand(t *testing.T) (string, string, domain.Skill) {
 	return configPath, dataDir, skill
 }
 
-func makeActivationRelease(t *testing.T, dataDir, skillID string) string {
+func makeActivationRelease(t *testing.T, dataDir string, skill domain.Skill) string {
 	t.Helper()
-	root := filepath.Join(dataDir, "releases", skillID)
-	release := filepath.Join(root, activationTestRevision)
+	revision := runActivationCommandGit(t, skill.RepositoryPath, "rev-parse", "HEAD")
+	root := filepath.Join(dataDir, "releases", skill.ID)
+	release := filepath.Join(root, revision)
 	if err := os.MkdirAll(release, 0o700); err != nil {
 		t.Fatalf("create release: %v", err)
 	}
@@ -125,7 +134,7 @@ func makeActivationRelease(t *testing.T, dataDir, skillID string) string {
 		t.Fatalf("make release immutable: %v", err)
 	}
 	t.Cleanup(func() { _ = os.Chmod(release, 0o700) })
-	if err := os.Symlink(activationTestRevision, filepath.Join(root, "current")); err != nil {
+	if err := os.Symlink(revision, filepath.Join(root, "current")); err != nil {
 		t.Fatalf("create current release link: %v", err)
 	}
 	current, err := filepath.Abs(filepath.Join(root, "current"))
@@ -133,4 +142,14 @@ func makeActivationRelease(t *testing.T, dataDir, skillID string) string {
 		t.Fatalf("resolve current release path: %v", err)
 	}
 	return current
+}
+
+func runActivationCommandGit(t *testing.T, repository string, args ...string) string {
+	t.Helper()
+	command := exec.Command("git", append([]string{"-C", repository}, args...)...)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, output)
+	}
+	return strings.TrimSpace(string(output))
 }

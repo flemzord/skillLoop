@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"os"
@@ -141,11 +142,11 @@ func TestConcurrentCreateReservesOnlyOneProposal(t *testing.T) {
 	}
 }
 
-func TestAutopilotKeepsRiskyCandidateForExplicitApproval(t *testing.T) {
+func TestAutopilotKeepsCorrectionForExplicitApprovalWithoutKeywordMarkers(t *testing.T) {
 	t.Setenv("SKILLLOOP_PIPELINE_RUNNER", "1")
 	command := []string{os.Args[0], "-test.run=^TestPipelineRunnerHelper$"}
 	manager, database, skill := newTestManager(t, domain.ModeAutopilot, command)
-	cluster := seedCluster(t, database, skill, "security permissions", "Review chmod permissions before applying the change.", 1)
+	cluster := seedCluster(t, database, skill, "response style", "Prefer concise answers when the user asks a short question.", 1)
 	result, err := manager.ProcessEligible(context.Background(), []domain.Cluster{cluster})
 	if err != nil {
 		t.Fatal(err)
@@ -250,6 +251,10 @@ func TestProcessEligibleRecreatesEmptyReservation(t *testing.T) {
 	if err != nil || !created {
 		t.Fatalf("reserve empty proposal: created=%v err=%v", created, err)
 	}
+	reserved.UpdatedAt = reserved.CreatedAt
+	if err := database.SaveProposal(context.Background(), reserved); err != nil {
+		t.Fatalf("age empty reservation: %v", err)
+	}
 	result, err := manager.ProcessEligible(context.Background(), nil)
 	if err != nil || result.Created != 1 || result.Evaluated != 1 || len(result.Failures) != 0 {
 		t.Fatalf("recreate result=%#v err=%v", result, err)
@@ -263,7 +268,7 @@ func TestProcessEligibleRecreatesEmptyReservation(t *testing.T) {
 func TestAutopilotResumesApprovedProposal(t *testing.T) {
 	t.Setenv("SKILLLOOP_PIPELINE_RUNNER", "1")
 	manager, database, skill := newTestManager(t, domain.ModeAutopilot, []string{os.Args[0], "-test.run=^TestPipelineRunnerHelper$"})
-	cluster := seedCluster(t, database, skill, "resume approved", "Validate the exact output.", 1)
+	cluster := seedClusterKind(t, database, skill, domain.CardValidation, "resume approved", "Validate the exact output.", 1)
 	proposal, created, err := manager.Create(context.Background(), cluster.ID, "test")
 	if err != nil || !created {
 		t.Fatalf("create: created=%v err=%v", created, err)
@@ -282,6 +287,86 @@ func TestAutopilotResumesApprovedProposal(t *testing.T) {
 	active, err := database.ActivePromotion(context.Background(), skill.ID)
 	if err != nil || active.ProposalID != proposal.ID {
 		t.Fatalf("active promotion=%#v err=%v", active, err)
+	}
+}
+
+func TestAutopilotNeverResumesApprovedCorrection(t *testing.T) {
+	t.Setenv("SKILLLOOP_PIPELINE_RUNNER", "1")
+	manager, database, skill := newTestManager(t, domain.ModeAutopilot, []string{os.Args[0], "-test.run=^TestPipelineRunnerHelper$"})
+	cluster := seedCluster(t, database, skill, "approved correction", "Prefer concise output for short questions.", 1)
+	proposal, created, err := manager.Create(context.Background(), cluster.ID, "test")
+	if err != nil || !created {
+		t.Fatalf("create: created=%v err=%v", created, err)
+	}
+	proposal, _, err = manager.Evaluate(context.Background(), proposal.ID, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.ApproveProposal(context.Background(), proposal.ID, proposal.BaseCommit, proposal.CandidateCommit, "human", "{}"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := manager.ProcessEligible(context.Background(), nil)
+	if err != nil || result.Promoted != 0 || len(result.Failures) != 0 {
+		t.Fatalf("approved correction recovery result=%#v err=%v", result, err)
+	}
+	if _, err := database.ActivePromotion(context.Background(), skill.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("correction was autopromoted: %v", err)
+	}
+}
+
+func TestApproveCompensatesFilesystemWhenPromotionPersistenceFails(t *testing.T) {
+	t.Setenv("SKILLLOOP_PIPELINE_RUNNER", "1")
+	manager, database, skill := newTestManager(t, domain.ModePropose, []string{os.Args[0], "-test.run=^TestPipelineRunnerHelper$"})
+	cluster := seedClusterKind(t, database, skill, domain.CardValidation, "compensated promotion", "Validate the exact output.", 1)
+	result, err := manager.ProcessEligible(context.Background(), []domain.Cluster{cluster})
+	if err != nil || result.Evaluated != 1 || len(result.Failures) != 0 {
+		t.Fatalf("prepare proposal result=%#v err=%v", result, err)
+	}
+	proposals, err := database.ListProposals(context.Background(), domain.ProposalEvaluated)
+	if err != nil || len(proposals) != 1 {
+		t.Fatalf("evaluated proposals=%#v err=%v", proposals, err)
+	}
+	proposal := proposals[0]
+
+	faultDB, err := sql.Open("sqlite", filepath.Join(manager.Config.DataDir, "skillloop.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = faultDB.Close() }()
+	if _, err := faultDB.Exec(`
+		CREATE TRIGGER fail_promotion_persistence
+		BEFORE INSERT ON promotions
+		BEGIN SELECT RAISE(ABORT, 'injected promotion persistence failure'); END;
+	`); err != nil {
+		t.Fatalf("install fault trigger: %v", err)
+	}
+
+	if _, err := manager.Approve(context.Background(), proposal.ID, "tester"); err == nil ||
+		!strings.Contains(err.Error(), "filesystem promotion rolled back") {
+		t.Fatalf("approve error=%v, want compensated persistence failure", err)
+	}
+	current, err := manager.Improver.CurrentRelease(skill)
+	if err != nil || current.Commit != proposal.BaseCommit {
+		t.Fatalf("current after compensation=%#v err=%v, want baseline %s", current, err, proposal.BaseCommit)
+	}
+	if _, err := database.ActivePromotion(context.Background(), skill.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("durable promotion exists after failed transaction: %v", err)
+	}
+	stored, err := database.Proposal(context.Background(), proposal.ID)
+	if err != nil || stored.Status != domain.ProposalApproved {
+		t.Fatalf("proposal after compensation=%#v err=%v", stored, err)
+	}
+
+	if _, err := faultDB.Exec(`DROP TRIGGER fail_promotion_persistence`); err != nil {
+		t.Fatalf("remove fault trigger: %v", err)
+	}
+	promotion, err := manager.Approve(context.Background(), proposal.ID, "tester")
+	if err != nil {
+		t.Fatalf("retry compensated promotion: %v", err)
+	}
+	current, err = manager.Improver.CurrentRelease(skill)
+	if err != nil || current.Commit != promotion.PromotedCommit {
+		t.Fatalf("current after retry=%#v promotion=%#v err=%v", current, promotion, err)
 	}
 }
 
@@ -347,6 +432,10 @@ func newTestManager(t *testing.T, mode domain.AutonomyMode, command []string) (M
 }
 
 func seedCluster(t *testing.T, database *store.Store, skill domain.Skill, fingerprint, lesson string, offset int) domain.Cluster {
+	return seedClusterKind(t, database, skill, domain.CardCorrection, fingerprint, lesson, offset)
+}
+
+func seedClusterKind(t *testing.T, database *store.Store, skill domain.Skill, kind domain.CardKind, fingerprint, lesson string, offset int) domain.Cluster {
 	t.Helper()
 	for index := range 3 {
 		id := fmt.Sprintf("session-%d", offset+index)
@@ -356,7 +445,7 @@ func seedCluster(t *testing.T, database *store.Store, skill domain.Skill, finger
 		}
 		card := domain.LearningCard{
 			ID:         fmt.Sprintf("card-%d-%s", offset+index, strings.ReplaceAll(fingerprint, " ", "-")),
-			SessionRef: id, SkillID: skill.ID, Kind: domain.CardCorrection,
+			SessionRef: id, SkillID: skill.ID, Kind: kind,
 			Fingerprint: fingerprint, Summary: fingerprint, Lesson: lesson, Confidence: 0.9,
 			CreatedAt: time.Now().Add(time.Duration(index) * time.Second),
 		}

@@ -4,6 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/spf13/cobra"
 
@@ -207,10 +210,10 @@ type proposalEvaluationOutput struct {
 }
 
 func writeProposalView(writer io.Writer, view pipeline.ProposalView) error {
-	if _, err := fmt.Fprintf(writer, "proposal\t%s\t%s\t%s\t%s\n", view.Proposal.ID, view.Proposal.Status, view.Proposal.SkillID, view.Proposal.ClusterID); err != nil {
+	if _, err := fmt.Fprintf(writer, "proposal\t%s\t%s\t%s\t%s\n", terminalSafe(view.Proposal.ID), view.Proposal.Status, terminalSafe(view.Proposal.SkillID), terminalSafe(view.Proposal.ClusterID)); err != nil {
 		return err
 	}
-	if _, err := fmt.Fprintf(writer, "commits\tbase=%s\tcandidate=%s\n", view.Proposal.BaseCommit, view.Proposal.CandidateCommit); err != nil {
+	if _, err := fmt.Fprintf(writer, "commits\tbase=%s\tcandidate=%s\n", terminalSafe(view.Proposal.BaseCommit), terminalSafe(view.Proposal.CandidateCommit)); err != nil {
 		return err
 	}
 	if _, err := fmt.Fprintf(writer, "scores\tbaseline=%.2f\tcandidate=%.2f\n", view.Proposal.BaselineScore, view.Proposal.CandidateScore); err != nil {
@@ -220,21 +223,54 @@ func writeProposalView(writer io.Writer, view pipeline.ProposalView) error {
 		return err
 	}
 	for _, evaluation := range view.Evaluations {
-		if _, err := fmt.Fprintf(writer, "evaluation\t%s\tpassed=%t\tscore=%.2f\n", evaluation.Variant, evaluation.Passed, evaluation.Score); err != nil {
+		if _, err := fmt.Fprintf(writer, "evaluation\t%s\tpassed=%t\tscore=%.2f\n", terminalSafe(string(evaluation.Variant)), evaluation.Passed, evaluation.Score); err != nil {
 			return err
 		}
 	}
 	for _, audit := range view.Audit {
-		if _, err := fmt.Fprintf(writer, "audit\t%s\t%s\t%s\n", audit.Action, audit.Actor, audit.Details); err != nil {
+		if _, err := fmt.Fprintf(writer, "audit\t%s\t%s\t%s\n", terminalSafe(audit.Action), terminalSafe(audit.Actor), terminalSafe(audit.Details)); err != nil {
 			return err
 		}
 	}
 	if _, err := fmt.Fprintln(writer, "diff_begin"); err != nil {
 		return err
 	}
-	if _, err := fmt.Fprintln(writer, view.Diff); err != nil {
+	if _, err := fmt.Fprintln(writer, terminalSafe(view.Diff)); err != nil {
 		return err
 	}
 	_, err := fmt.Fprintln(writer, "diff_end")
 	return err
+}
+
+// terminalSafe preserves the line and column structure needed for human diff
+// review while rendering terminal control sequences as inert visible text.
+// Machine-readable JSON uses the original values and is intentionally exact.
+func terminalSafe(value string) string {
+	var output strings.Builder
+	for len(value) > 0 {
+		if value[0] < utf8.RuneSelf {
+			character := value[0]
+			value = value[1:]
+			switch {
+			case character == '\n' || character == '\t' || character >= 0x20 && character <= 0x7e:
+				output.WriteByte(character)
+			default:
+				_, _ = fmt.Fprintf(&output, `\x%02x`, character)
+			}
+			continue
+		}
+		character, size := utf8.DecodeRuneInString(value)
+		if character == utf8.RuneError && size == 1 {
+			_, _ = fmt.Fprintf(&output, `\x%02x`, value[0])
+			value = value[1:]
+			continue
+		}
+		value = value[size:]
+		if unicode.IsControl(character) || unicode.Is(unicode.Cf, character) {
+			_, _ = fmt.Fprintf(&output, `\u%04x`, character)
+			continue
+		}
+		output.WriteRune(character)
+	}
+	return output.String()
 }

@@ -3,19 +3,19 @@ package activation
 import (
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/flemzord/skillloop/internal/domain"
 )
 
-const testRevision = "0123456789abcdef0123456789abcdef01234567"
-
 func TestInstallAndUninstallBothPlatformsAreIdempotent(t *testing.T) {
 	dataDir := t.TempDir()
 	home := t.TempDir()
 	skill := domain.Skill{ID: "skill-demo", Name: "My Demo.Skill", Enabled: true}
-	current := makeCurrentRelease(t, dataDir, skill.ID)
+	current := makeCurrentRelease(t, dataDir, &skill)
 	service := Service{DataDir: dataDir, HomeDir: home}
 
 	results, err := service.Install(skill, nil)
@@ -66,7 +66,7 @@ func TestInstallCanTargetOnePlatform(t *testing.T) {
 	dataDir := t.TempDir()
 	home := t.TempDir()
 	skill := domain.Skill{ID: "skill-demo", Name: "demo", Enabled: true}
-	makeCurrentRelease(t, dataDir, skill.ID)
+	makeCurrentRelease(t, dataDir, &skill)
 	service := Service{DataDir: dataDir, HomeDir: home}
 
 	results, err := service.Install(skill, []Platform{PlatformCodex})
@@ -85,7 +85,7 @@ func TestInstallRefusesAnyUnmanagedDestinationBeforeChangingOthers(t *testing.T)
 	dataDir := t.TempDir()
 	home := t.TempDir()
 	skill := domain.Skill{ID: "skill-demo", Name: "demo", Enabled: true}
-	makeCurrentRelease(t, dataDir, skill.ID)
+	makeCurrentRelease(t, dataDir, &skill)
 	claudeDestination := filepath.Join(home, ".claude", "skills", "demo")
 	if err := os.MkdirAll(filepath.Dir(claudeDestination), 0o700); err != nil {
 		t.Fatalf("create Claude skills directory: %v", err)
@@ -111,7 +111,7 @@ func TestUninstallRemovesOnlyExactManagedLink(t *testing.T) {
 	dataDir := t.TempDir()
 	home := t.TempDir()
 	skill := domain.Skill{ID: "skill-demo", Name: "demo", Enabled: true}
-	current := makeCurrentRelease(t, dataDir, skill.ID)
+	current := makeCurrentRelease(t, dataDir, &skill)
 	codexDestination := filepath.Join(home, ".codex", "skills", "demo")
 	claudeDestination := filepath.Join(home, ".claude", "skills", "demo")
 	for _, destination := range []string{codexDestination, claudeDestination} {
@@ -170,14 +170,28 @@ func TestSafeName(t *testing.T) {
 	}
 }
 
-func makeCurrentRelease(t *testing.T, dataDir, skillID string) string {
+func makeCurrentRelease(t *testing.T, dataDir string, skill *domain.Skill) string {
 	t.Helper()
-	root := filepath.Join(dataDir, "releases", skillID)
-	release := filepath.Join(root, testRevision)
+	repository := t.TempDir()
+	runActivationGit(t, repository, "init", "-b", "main")
+	runActivationGit(t, repository, "config", "user.name", "Test User")
+	runActivationGit(t, repository, "config", "user.email", "test@example.invalid")
+	contents := []byte("# Demo\n")
+	if err := os.WriteFile(filepath.Join(repository, "SKILL.md"), contents, 0o644); err != nil {
+		t.Fatalf("write repository skill: %v", err)
+	}
+	runActivationGit(t, repository, "add", "SKILL.md")
+	runActivationGit(t, repository, "commit", "-m", "feat: add demo skill")
+	revision := runActivationGit(t, repository, "rev-parse", "HEAD")
+	skill.RepositoryPath = repository
+	skill.InstructionPath = "SKILL.md"
+
+	root := filepath.Join(dataDir, "releases", skill.ID)
+	release := filepath.Join(root, revision)
 	if err := os.MkdirAll(release, 0o700); err != nil {
 		t.Fatalf("create release: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(release, "SKILL.md"), []byte("# Demo\n"), 0o444); err != nil {
+	if err := os.WriteFile(filepath.Join(release, "SKILL.md"), contents, 0o444); err != nil {
 		t.Fatalf("write release: %v", err)
 	}
 	if err := os.Chmod(release, 0o555); err != nil {
@@ -186,7 +200,7 @@ func makeCurrentRelease(t *testing.T, dataDir, skillID string) string {
 	t.Cleanup(func() {
 		_ = os.Chmod(release, 0o700)
 	})
-	if err := os.Symlink(testRevision, filepath.Join(root, "current")); err != nil {
+	if err := os.Symlink(revision, filepath.Join(root, "current")); err != nil {
 		t.Fatalf("create current release link: %v", err)
 	}
 	current, err := filepath.Abs(filepath.Join(root, "current"))
@@ -194,4 +208,14 @@ func makeCurrentRelease(t *testing.T, dataDir, skillID string) string {
 		t.Fatalf("resolve current release path: %v", err)
 	}
 	return current
+}
+
+func runActivationGit(t *testing.T, repository string, args ...string) string {
+	t.Helper()
+	command := exec.Command("git", append([]string{"-C", repository}, args...)...)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, output)
+	}
+	return strings.TrimSpace(string(output))
 }

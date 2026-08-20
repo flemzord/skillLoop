@@ -5,7 +5,7 @@ import (
 	"fmt"
 )
 
-const schemaVersion = 1
+const schemaVersion = 2
 
 const schemaV1 = `
 CREATE TABLE skills (
@@ -152,6 +152,15 @@ CREATE INDEX audit_entity_idx
 	ON audit_log(entity_type, entity_id, id);
 `
 
+const schemaV2 = `
+ALTER TABLE proposals ADD COLUMN fingerprint TEXT NOT NULL DEFAULT '';
+ALTER TABLE proposals ADD COLUMN lesson TEXT NOT NULL DEFAULT '';
+ALTER TABLE proposals ADD COLUMN card_kind TEXT NOT NULL DEFAULT ''
+	CHECK (card_kind IN ('', 'correction', 'failure', 'validation'));
+ALTER TABLE proposals ADD COLUMN requires_human_approval INTEGER NOT NULL DEFAULT 1
+	CHECK (requires_human_approval IN (0, 1));
+`
+
 func (s *Store) migrate(ctx context.Context) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -181,9 +190,21 @@ func (s *Store) migrate(ctx context.Context) error {
 		}
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)`,
-			schemaVersion, unixNano(s.now()),
+			1, unixNano(s.now()),
 		); err != nil {
 			return fmt.Errorf("store: record schema v1: %w", err)
+		}
+		version = 1
+	}
+	if version == 1 {
+		if _, err := tx.ExecContext(ctx, schemaV2); err != nil {
+			return fmt.Errorf("store: apply schema v2: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)`,
+			2, unixNano(s.now()),
+		); err != nil {
+			return fmt.Errorf("store: record schema v2: %w", err)
 		}
 	}
 

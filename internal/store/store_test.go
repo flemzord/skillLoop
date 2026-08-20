@@ -2,14 +2,17 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/flemzord/skillloop/internal/domain"
+	"github.com/flemzord/skillloop/internal/learning"
 )
 
 func TestOpenConfiguresSQLiteAndConstraints(t *testing.T) {
@@ -61,6 +64,71 @@ func TestOpenConfiguresSQLiteAndConstraints(t *testing.T) {
 	}
 	if version != schemaVersion {
 		t.Fatalf("schema version = %d, want %d", version, schemaVersion)
+	}
+}
+
+func TestOpenMigratesSchemaV1ProposalSafetyMetadataFailClosed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	database, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`
+		CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL);
+		` + schemaV1 + `
+		INSERT INTO skills (
+			id, name, repository_path, instruction_path, enabled, created_at
+		) VALUES ('legacy-skill', 'Legacy', '/tmp/legacy', 'SKILL.md', 1, 1);
+		INSERT INTO clusters (
+			id, skill_id, kind, fingerprint, summary, lesson,
+			card_count, session_count, status, updated_at
+		) VALUES (
+			'legacy-cluster', 'legacy-skill', 'validation', 'legacy-fingerprint',
+			'old summary', 'old mutable lesson', 3, 3, 'proposed', 1
+		);
+		INSERT INTO proposals (
+			id, cluster_id, skill_id, status, repository_path, worktree_path,
+			branch, base_commit, candidate_commit, baseline_score, candidate_score,
+			previous_commit, promoted_commit, created_at, updated_at
+		) VALUES (
+			'legacy-proposal', 'legacy-cluster', 'legacy-skill', 'pending', '/tmp/legacy',
+			'/tmp/worktree', 'skillloop/legacy', 'base-commit', 'candidate-commit',
+			0, 0, '', '', 1, 1
+		);
+		INSERT INTO schema_migrations (version, applied_at) VALUES (1, 1);`); err != nil {
+		_ = database.Close()
+		t.Fatalf("seed schema v1: %v", err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	migrated, err := Open(context.Background(), path)
+	if err != nil {
+		t.Fatalf("open legacy schema: %v", err)
+	}
+	defer func() { _ = migrated.Close() }()
+	var version int
+	if err := migrated.db.QueryRow(`SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != schemaVersion {
+		t.Fatalf("schema version=%d, want %d", version, schemaVersion)
+	}
+	var requiresHuman int
+	if err := migrated.db.QueryRow(`SELECT dflt_value FROM pragma_table_info('proposals') WHERE name = 'requires_human_approval'`).Scan(&requiresHuman); err != nil {
+		t.Fatalf("read migrated safety default: %v", err)
+	}
+	if requiresHuman != 1 {
+		t.Fatalf("legacy proposal safety default=%d, want fail-closed 1", requiresHuman)
+	}
+	legacy, err := migrated.Proposal(context.Background(), "legacy-proposal")
+	if err != nil {
+		t.Fatalf("read migrated legacy proposal: %v", err)
+	}
+	if legacy.Fingerprint != "" || legacy.Lesson != "" || legacy.CardKind != "" ||
+		!legacy.RequiresHumanApproval || legacy.BaseCommit != "base-commit" || legacy.CandidateCommit != "candidate-commit" {
+		t.Fatalf("migrated legacy proposal lost fail-closed compatibility state: %#v", legacy)
 	}
 }
 
@@ -121,6 +189,73 @@ func TestSessionAndLearningCardInsertsAreIdempotent(t *testing.T) {
 	}
 	if counts.Skills != 1 || counts.Sessions != 1 || counts.Cards != 1 {
 		t.Fatalf("counts = %#v, want one skill/session/card", counts)
+	}
+}
+
+func TestAddLearningCardRedactsLowerTrustFieldsWithoutChangingQuorumIdentity(t *testing.T) {
+	database := openTestStore(t)
+	ctx := context.Background()
+	skill := testSkill("durable-redaction")
+	mustRegisterSkill(t, database, skill)
+
+	const (
+		fingerprint = "failure stable-direct-boundary lesson-stable"
+		jwt         = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJkaXJlY3QtaW5zZXJ0In0.c2lnbmF0dXJlX3ZhbHVl"
+		gitlabToken = "glpat-abcdefghijklmnopqrstuvwx"
+		privateKey  = "-----BEGIN PRIVATE KEY-----\nZmFrZS1wcml2YXRlLWtleQ==\n-----END PRIVATE KEY-----"
+	)
+	for index := range 3 {
+		session := testSession(fmt.Sprintf("direct-redaction-%d", index))
+		mustRecordSession(t, database, session)
+		card := testCard(fmt.Sprintf("direct-card-%d", index), session.Reference, skill.ID, fingerprint)
+		card.Summary = "Observed credential " + jwt
+		card.Lesson = "Never persist " + privateKey + " or " + gitlabToken
+		created, err := database.AddLearningCard(ctx, card)
+		if err != nil || !created {
+			t.Fatalf("direct add %d: created=%v err=%v", index, created, err)
+		}
+	}
+
+	cards, err := database.ListLearningCards(ctx, skill.ID)
+	if err != nil || len(cards) != 3 {
+		t.Fatalf("cards=%#v err=%v", cards, err)
+	}
+	for _, card := range cards {
+		if card.Fingerprint != fingerprint {
+			t.Fatalf("durable sanitization changed fingerprint: %q", card.Fingerprint)
+		}
+		persisted := card.Summary + " " + card.Lesson
+		for _, forbidden := range []string{jwt, gitlabToken, "BEGIN PRIVATE KEY", "ZmFrZS1wcml2YXRlLWtleQ"} {
+			if strings.Contains(persisted, forbidden) {
+				t.Fatalf("secret %q survived direct persistence: %q", forbidden, persisted)
+			}
+		}
+		if !strings.Contains(card.Summary, "[REDACTED_SECRET]") || !strings.Contains(card.Lesson, "[REDACTED_SECRET]") {
+			t.Fatalf("card was not redacted at the durable boundary: %#v", card)
+		}
+	}
+
+	clusters, err := database.RebuildClusters(ctx, 3)
+	if err != nil || len(clusters) != 1 || clusters[0].Fingerprint != fingerprint || clusters[0].SessionCount != 3 {
+		t.Fatalf("sanitized cards lost quorum identity: clusters=%#v err=%v", clusters, err)
+	}
+}
+
+func TestAddLearningCardRejectsSecretFingerprint(t *testing.T) {
+	database := openTestStore(t)
+	ctx := context.Background()
+	skill := testSkill("secret-fingerprint")
+	mustRegisterSkill(t, database, skill)
+	session := testSession("secret-fingerprint")
+	mustRecordSession(t, database, session)
+
+	card := testCard("secret-fingerprint", session.Reference, skill.ID,
+		"failure github_pat_11AA22bb33CC44dd55EE66ff77GG88hh99II00jj")
+	if created, err := database.AddLearningCard(ctx, card); err == nil || created {
+		t.Fatalf("secret fingerprint accepted: created=%v err=%v", created, err)
+	}
+	if cards, err := database.ListLearningCards(ctx, skill.ID); err != nil || len(cards) != 0 {
+		t.Fatalf("secret fingerprint reached durable storage: cards=%#v err=%v", cards, err)
 	}
 }
 
@@ -326,6 +461,68 @@ func TestRebuildClustersCountsDistinctSessionsAndPreservesStatus(t *testing.T) {
 	}
 }
 
+func TestRebuildClustersRequiresConcordantRecoveryLessons(t *testing.T) {
+	database := openTestStore(t)
+	ctx := context.Background()
+	skill := domain.Skill{
+		ID: "skill-quorum", Name: "quorum", RepositoryPath: "/skills/quorum",
+		InstructionPath: "SKILL.md", Enabled: true,
+	}
+	mustRegisterSkill(t, database, skill)
+	recoveries := []string{
+		`{"command":"nix develop --command go test ./..."}`,
+		`{"command":"nix develop --command go test ./..."}`,
+		`{"command":"nix develop --command go test ./..."}`,
+		`{"command":"go test -run Hostile ./..."}`,
+	}
+
+	var concordantFingerprint string
+	for index, recovery := range recoveries {
+		session := testSession(fmt.Sprintf("quorum-session-%d", index))
+		session.Messages = []domain.Message{
+			{Role: "tool", ToolName: "exec_command", ToolCallID: "read", Text: `{"cmd":"sed -n '1,240p' /skills/quorum/SKILL.md"}`},
+			{Role: "tool", ToolName: "exec_command", ToolCallID: "read", ToolResult: true, Text: "skill instructions"},
+			{Role: "tool", ToolName: "exec_command", ToolCallID: "failed", Text: `{"cmd":"go test ./..."}`},
+			{Role: "tool", ToolName: "exec_command", ToolCallID: "failed", ToolResult: true, Failed: true, Text: "exit code 1"},
+			{Role: "tool", ToolName: "exec_command", ToolCallID: "recovery", Text: strings.Replace(recovery, `"command"`, `"cmd"`, 1)},
+			{Role: "tool", ToolName: "exec_command", ToolCallID: "recovery", ToolResult: true, Text: "ok"},
+		}
+		mustRecordSession(t, database, session)
+		cards := learning.NewAnalyzer().Analyze(session, []domain.Skill{skill})
+		var failure domain.LearningCard
+		for _, card := range cards {
+			if card.Kind == domain.CardFailure {
+				failure = card
+				break
+			}
+		}
+		if failure.ID == "" {
+			t.Fatalf("session %d produced no failure card: %#v", index, cards)
+		}
+		switch {
+		case index == 0:
+			concordantFingerprint = failure.Fingerprint
+		case index < 3 && failure.Fingerprint != concordantFingerprint:
+			t.Fatalf("concordant session %d split to %q", index, failure.Fingerprint)
+		case index == 3 && failure.Fingerprint == concordantFingerprint:
+			t.Fatalf("hostile recovery inherited fingerprint %q", failure.Fingerprint)
+		}
+		mustAddCard(t, database, failure)
+	}
+
+	clusters, err := database.RebuildClusters(ctx, 3)
+	if err != nil {
+		t.Fatalf("rebuild clusters: %v", err)
+	}
+	if len(clusters) != 1 || clusters[0].SessionCount != 3 || clusters[0].CardCount != 3 {
+		t.Fatalf("eligible clusters = %#v, want only the three concordant sessions", clusters)
+	}
+	if !strings.Contains(clusters[0].Lesson, "nix develop --command go test") ||
+		strings.Contains(clusters[0].Lesson, "Hostile") {
+		t.Fatalf("cluster inherited a disagreeing recovery: %#v", clusters[0])
+	}
+}
+
 func TestJobsAreIdempotentAndLeased(t *testing.T) {
 	store := openTestStore(t)
 	ctx := context.Background()
@@ -437,6 +634,9 @@ func TestProposalEvaluationPromotionRollbackAndAudit(t *testing.T) {
 		Branch:          "skillloop/proposal-1",
 		BaseCommit:      "base",
 		CandidateCommit: "candidate",
+		Fingerprint:     "stored-fingerprint",
+		Lesson:          "Validate the candidate before promotion.",
+		CardKind:        domain.CardValidation,
 		BaselineScore:   0,
 		CandidateScore:  1,
 	}
@@ -552,6 +752,92 @@ func TestProposalEvaluationPromotionRollbackAndAudit(t *testing.T) {
 	}
 	if counts.ActivePromotions != 0 || counts.Rollbacks != 1 || counts.Proposals[domain.ProposalRolledBack] != 1 {
 		t.Fatalf("lifecycle counts = %#v", counts)
+	}
+}
+
+func TestAbandonProposalIfUnchangedPreservesConcurrentReservationUpdates(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	skill, cluster := seedEligibleCluster(t, store)
+	observedTime := time.Date(2026, 8, 20, 10, 0, 0, 123, time.UTC)
+	store.now = func() time.Time { return observedTime }
+	reserved := domain.Proposal{
+		ID: "proposal-cas", ClusterID: cluster.ID, SkillID: skill.ID,
+		Status: domain.ProposalPending, RepositoryPath: skill.RepositoryPath,
+	}
+	created, err := store.ReserveProposal(ctx, reserved)
+	if err != nil || !created {
+		t.Fatalf("reserve: created=%v err=%v", created, err)
+	}
+	observed, err := store.Proposal(ctx, reserved.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	updatedTime := observedTime.Add(time.Minute)
+	store.now = func() time.Time { return updatedTime }
+	filled := observed
+	filled.BaseCommit = "base"
+	filled.CandidateCommit = "candidate"
+	filled.Fingerprint = "exact-fingerprint"
+	filled.Lesson = "Validate the exact candidate output."
+	filled.CardKind = domain.CardValidation
+	filled.RequiresHumanApproval = false
+	filled.UpdatedAt = updatedTime
+	if err := store.SaveProposal(ctx, filled); err != nil {
+		t.Fatalf("fill reservation: %v", err)
+	}
+
+	abandoned, err := store.AbandonProposalIfUnchanged(ctx, observed.ID, observed.UpdatedAt)
+	if err != nil || abandoned {
+		t.Fatalf("stale CAS abandon: abandoned=%v err=%v", abandoned, err)
+	}
+	stillFilled, err := store.Proposal(ctx, observed.ID)
+	if err != nil || stillFilled.CandidateCommit != filled.CandidateCommit {
+		t.Fatalf("concurrent proposal was lost: %#v err=%v", stillFilled, err)
+	}
+	stillClaimed, err := store.Cluster(ctx, cluster.ID)
+	if err != nil || stillClaimed.Status != domain.ClusterProposed {
+		t.Fatalf("cluster claim was reopened: %#v err=%v", stillClaimed, err)
+	}
+}
+
+func TestAbandonProposalIfUnchangedPreservesConcurrentEmptyRefresh(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	skill, cluster := seedEligibleCluster(t, store)
+	observedTime := time.Date(2026, 8, 20, 11, 0, 0, 456, time.UTC)
+	store.now = func() time.Time { return observedTime }
+	reserved := domain.Proposal{
+		ID: "proposal-refresh-cas", ClusterID: cluster.ID, SkillID: skill.ID,
+		Status: domain.ProposalPending, RepositoryPath: skill.RepositoryPath,
+	}
+	created, err := store.ReserveProposal(ctx, reserved)
+	if err != nil || !created {
+		t.Fatalf("reserve: created=%v err=%v", created, err)
+	}
+	observed, err := store.Proposal(ctx, reserved.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	refreshedTime := observedTime.Add(time.Minute)
+	refreshed := observed
+	refreshed.UpdatedAt = refreshedTime
+	if err := store.SaveProposal(ctx, refreshed); err != nil {
+		t.Fatalf("refresh reservation: %v", err)
+	}
+	abandoned, err := store.AbandonProposalIfUnchanged(ctx, observed.ID, observed.UpdatedAt)
+	if err != nil || abandoned {
+		t.Fatalf("stale CAS abandoned refreshed reservation: abandoned=%v err=%v", abandoned, err)
+	}
+	current, err := store.Proposal(ctx, observed.ID)
+	if err != nil || current.UpdatedAt != refreshedTime || current.CandidateCommit != "" {
+		t.Fatalf("refreshed empty reservation changed: %#v err=%v", current, err)
+	}
+	abandoned, err = store.AbandonProposalIfUnchanged(ctx, current.ID, current.UpdatedAt)
+	if err != nil || !abandoned {
+		t.Fatalf("current CAS did not abandon exact empty reservation: abandoned=%v err=%v", abandoned, err)
 	}
 }
 

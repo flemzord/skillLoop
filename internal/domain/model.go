@@ -139,21 +139,25 @@ const (
 )
 
 type Proposal struct {
-	ID              string
-	ClusterID       string
-	SkillID         string
-	Status          ProposalStatus
-	RepositoryPath  string
-	WorktreePath    string
-	Branch          string
-	BaseCommit      string
-	CandidateCommit string
-	BaselineScore   float64
-	CandidateScore  float64
-	PreviousCommit  string
-	PromotedCommit  string
-	CreatedAt       time.Time
-	UpdatedAt       time.Time
+	ID                    string
+	ClusterID             string
+	SkillID               string
+	Fingerprint           string
+	Lesson                string
+	CardKind              CardKind
+	RequiresHumanApproval bool
+	Status                ProposalStatus
+	RepositoryPath        string
+	WorktreePath          string
+	Branch                string
+	BaseCommit            string
+	CandidateCommit       string
+	BaselineScore         float64
+	CandidateScore        float64
+	PreviousCommit        string
+	PromotedCommit        string
+	CreatedAt             time.Time
+	UpdatedAt             time.Time
 }
 
 type EvaluationVariant string

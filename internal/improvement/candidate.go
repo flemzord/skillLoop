@@ -14,6 +14,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/flemzord/skillloop/internal/domain"
+	"github.com/flemzord/skillloop/internal/sanitize"
 )
 
 const (
@@ -26,14 +27,6 @@ var (
 	managedMarker      = regexp.MustCompile(`^<!-- skillloop:(begin|end) ([A-Za-z0-9][A-Za-z0-9._:-]{0,127}) -->$`)
 	sensitiveChange    = regexp.MustCompile(`(?i)\b(security|permissions?|secrets?|credentials?|passwords?|passphrases?|api[ _-]?keys?|private[ _-]?keys?|access[ _-]?tokens?|auth(?:entication|orization)?|oauth|sudo|chmod|sandbox|firewalls?|privileges?|roles?|acl|iam|ssh|tls|certificates?|encryption|cryptograph(?:y|ic))\b`)
 	promptInjection    = regexp.MustCompile(`(?i)\b(ignore (all |any )?(previous|prior)|system prompt|developer message|jailbreak|bypass (the )?(instructions?|guardrails?|safety)|override (the )?instructions?|disable (the )?(guardrails?|safety)|exfiltrate|prompt injection)\b`)
-	secretPatterns     = []*regexp.Regexp{
-		regexp.MustCompile(`-----BEGIN [A-Z ]*PRIVATE KEY-----`),
-		regexp.MustCompile(`\bAKIA[0-9A-Z]{16}\b`),
-		regexp.MustCompile(`\bgh[pousr]_[A-Za-z0-9]{30,}\b`),
-		regexp.MustCompile(`\bxox[baprs]-[A-Za-z0-9-]{20,}\b`),
-		regexp.MustCompile(`\bsk-[A-Za-z0-9_-]{20,}\b`),
-		regexp.MustCompile(`(?i)\b(password|passwd|secret|access_token|api_key)\s*[:=]\s*[^\s$<{][^\s]{7,}`),
-	}
 )
 
 // Prepare creates and commits a candidate in an isolated worktree. The source
@@ -59,11 +52,13 @@ func (service Service) Prepare(ctx context.Context, skill domain.Skill, cluster 
 	if lesson == "" {
 		return Candidate{}, errors.New("cluster lesson is required")
 	}
-	if containsSecret(lesson) {
+	if sanitize.ContainsSecret(lesson) {
 		return Candidate{}, ErrUnsafeChange
 	}
-	requiresHumanApproval := sensitiveChange.MatchString(cluster.Summary+"\n"+lesson) ||
-		promptInjection.MatchString(cluster.Summary+"\n"+lesson)
+	requiresHumanApproval, err := classifyCandidate(cluster.Kind, cluster.Summary, lesson)
+	if err != nil {
+		return Candidate{}, err
+	}
 
 	repository, err := resolveRepository(ctx, skill.RepositoryPath)
 	if err != nil {
@@ -93,6 +88,9 @@ func (service Service) Prepare(ctx context.Context, skill domain.Skill, cluster 
 	if err := verifyTrackedInstruction(ctx, repository, base, relative); err != nil {
 		return Candidate{}, err
 	}
+	if err := preflightWorktree(ctx, repository, base); err != nil {
+		return Candidate{}, err
+	}
 
 	suffix, err := randomSuffix()
 	if err != nil {
@@ -107,7 +105,7 @@ func (service Service) Prepare(ctx context.Context, skill domain.Skill, cluster 
 		return Candidate{}, fmt.Errorf("create worktree parent: %w", err)
 	}
 	branch := "skillloop/" + safeName(skill.ID) + "/" + safeName(cluster.ID) + "-" + suffix
-	if _, err := git(ctx, repository, "worktree", "add", "-b", branch, worktree, base); err != nil {
+	if _, err := addWorktree(ctx, repository, "-b", branch, worktree, base); err != nil {
 		return Candidate{}, err
 	}
 	keepWorktree := false
@@ -120,7 +118,7 @@ func (service Service) Prepare(ctx context.Context, skill domain.Skill, cluster 
 	}()
 
 	instruction := filepath.Join(worktree, filepath.FromSlash(relative))
-	currentContents, err := os.ReadFile(instruction)
+	currentContents, err := readFileLimit(instruction, maxSkillFileBytes)
 	if err != nil {
 		return Candidate{}, fmt.Errorf("read candidate SKILL.md: %w", err)
 	}
@@ -131,7 +129,7 @@ func (service Service) Prepare(ctx context.Context, skill domain.Skill, cluster 
 	if string(updated) == string(currentContents) {
 		return Candidate{}, errors.New("candidate produces no change")
 	}
-	if containsSecret(string(updated)) {
+	if sanitize.ContainsSecret(string(updated)) {
 		return Candidate{}, ErrUnsafeChange
 	}
 	info, err := os.Stat(instruction)
@@ -142,21 +140,21 @@ func (service Service) Prepare(ctx context.Context, skill domain.Skill, cluster 
 		return Candidate{}, fmt.Errorf("write candidate SKILL.md: %w", err)
 	}
 
-	changed, err := git(ctx, worktree, "diff", "--name-only")
+	changed, err := gitWithoutFilters(ctx, worktree, "diff", "--name-only")
 	if err != nil {
 		return Candidate{}, err
 	}
 	if changed != relative {
 		return Candidate{}, fmt.Errorf("candidate changed %q instead of only %q: %w", changed, relative, ErrUnsafePath)
 	}
-	diff, err := git(ctx, worktree, "diff", "--no-ext-diff", "--", relative)
+	diff, err := gitWithoutFilters(ctx, worktree, "diff", "--no-ext-diff", "--", relative)
 	if err != nil {
 		return Candidate{}, err
 	}
 	if err := validateDiff(diff); err != nil {
 		return Candidate{}, err
 	}
-	if containsSecret(diff) {
+	if sanitize.ContainsSecret(diff) {
 		return Candidate{}, ErrUnsafeChange
 	}
 	reapplied, err := applyManagedBlock(updated, fingerprint, lesson)
@@ -164,21 +162,21 @@ func (service Service) Prepare(ctx context.Context, skill domain.Skill, cluster 
 		return Candidate{}, errors.New("candidate patch is not idempotent")
 	}
 
-	if _, err := git(ctx, worktree, "add", "--", relative); err != nil {
+	if _, err := gitWithoutFilters(ctx, worktree, "add", "--", relative); err != nil {
 		return Candidate{}, err
 	}
 	message := "feat(skill): improve " + safeName(skill.Name)
 	if skill.Name == "" {
 		message = "feat(skill): improve managed guidance"
 	}
-	if _, err := git(ctx, worktree,
+	if _, err := gitWithoutFilters(ctx, worktree,
 		"-c", "user.name=SkillLoop",
 		"-c", "user.email=skillloop@localhost",
 		"commit", "-m", message,
 	); err != nil {
 		return Candidate{}, err
 	}
-	candidateCommit, err := git(ctx, worktree, "rev-parse", "HEAD^{commit}")
+	candidateCommit, err := gitWithoutFilters(ctx, worktree, "rev-parse", "HEAD^{commit}")
 	if err != nil {
 		return Candidate{}, err
 	}
@@ -200,6 +198,7 @@ func (service Service) Prepare(ctx context.Context, skill domain.Skill, cluster 
 		ClusterID:             cluster.ID,
 		Fingerprint:           fingerprint,
 		Lesson:                lesson,
+		CardKind:              cluster.Kind,
 		RepositoryPath:        repository,
 		InstructionPath:       relative,
 		WorktreePath:          worktree,
@@ -210,6 +209,22 @@ func (service Service) Prepare(ctx context.Context, skill domain.Skill, cluster 
 		RequiresHumanApproval: requiresHumanApproval,
 		CreatedAt:             time.Now().UTC(),
 	}, nil
+}
+
+// classifyCandidate is deliberately structural: corrections and failures are
+// observations about model behavior and therefore always require a person to
+// approve the resulting instruction change. Only a validation card can be
+// considered for autopilot, and textual risk markers still make it fail closed.
+func classifyCandidate(kind domain.CardKind, summary, lesson string) (bool, error) {
+	switch kind {
+	case domain.CardCorrection, domain.CardFailure:
+		return true, nil
+	case domain.CardValidation:
+		text := summary + "\n" + lesson
+		return sensitiveChange.MatchString(text) || promptInjection.MatchString(text), nil
+	default:
+		return true, fmt.Errorf("unsupported learning card kind %q: %w", kind, ErrUnsafeChange)
+	}
 }
 
 // MarkerFingerprint returns a stable value safe to embed in an HTML comment.
@@ -314,15 +329,6 @@ func validateDiff(diff string) error {
 		return fmt.Errorf("diff has %d changed lines and %d bytes: %w", lines, len([]byte(diff)), ErrDiffLimit)
 	}
 	return nil
-}
-
-func containsSecret(contents string) bool {
-	for _, pattern := range secretPatterns {
-		if pattern.MatchString(contents) {
-			return true
-		}
-	}
-	return false
 }
 
 func bytesContainNUL(contents []byte) bool {

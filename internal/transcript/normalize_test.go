@@ -4,7 +4,11 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/flemzord/skillloop/internal/domain"
 )
@@ -15,7 +19,7 @@ func TestNormalizeCodexTranscript(t *testing.T) {
 {"type":"response_item","payload":{"type":"function_call_output","call_id":"call-1","output":"Process exited with code 1\nFinal output:\npackage failed"}}
 {"type":"event_msg","payload":{"type":"agent_message","message":"I will fix it."}}
 `)
-	session, err := (Normalizer{}).Normalize(context.Background(), domain.HookEvent{
+	session, err := normalizerFor(path, domain.SourceCodex).Normalize(context.Background(), domain.HookEvent{
 		ID: "event-1", Source: domain.SourceCodex, SessionID: "session-1", TranscriptPath: path,
 	})
 	if err != nil {
@@ -44,7 +48,7 @@ func TestNormalizeClaudeTranscript(t *testing.T) {
 {"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-1","content":"ok","is_error":false}]}}
 {incomplete
 `)
-	session, err := (Normalizer{}).Normalize(context.Background(), domain.HookEvent{
+	session, err := normalizerFor(path, domain.SourceClaude).Normalize(context.Background(), domain.HookEvent{
 		ID: "event-2", Source: domain.SourceClaude, SessionID: "session-2", TranscriptPath: path,
 	})
 	if err != nil {
@@ -71,7 +75,7 @@ func TestSessionOutcomeUsesLastCorrelatedToolResult(t *testing.T) {
 {"type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"call-2","arguments":"{}"}}
 {"type":"response_item","payload":{"type":"function_call_output","call_id":"call-2","output":"ok"}}
 `)
-	session, err := (Normalizer{}).Normalize(context.Background(), domain.HookEvent{
+	session, err := normalizerFor(path, domain.SourceCodex).Normalize(context.Background(), domain.HookEvent{
 		Source: domain.SourceCodex, SessionID: "latest-result", TranscriptPath: path,
 	})
 	if err != nil {
@@ -86,7 +90,7 @@ func TestSessionOutcomeIsUnknownWithoutCorrelatedToolResults(t *testing.T) {
 	path := writeTranscript(t, `{"type":"response_item","payload":{"type":"function_call_output","call_id":"missing","output":"ok"}}
 {"type":"event_msg","payload":{"type":"agent_message","message":"done"}}
 `)
-	session, err := (Normalizer{}).Normalize(context.Background(), domain.HookEvent{
+	session, err := normalizerFor(path, domain.SourceCodex).Normalize(context.Background(), domain.HookEvent{
 		Source: domain.SourceCodex, SessionID: "no-results", TranscriptPath: path,
 	})
 	if err != nil {
@@ -102,6 +106,237 @@ func TestNormalizeRejectsMissingTranscript(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected missing transcript error")
 	}
+}
+
+func TestNormalizeAcceptsStandardProviderTranscriptRoots(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("CODEX_HOME", "")
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+
+	tests := []struct {
+		name   string
+		source domain.Source
+		path   string
+		line   string
+	}{
+		{
+			name:   "Codex sessions",
+			source: domain.SourceCodex,
+			path:   filepath.Join(home, ".codex", "sessions", "2026", "08", "session.jsonl"),
+			line:   `{"type":"event_msg","payload":{"type":"agent_message","message":"codex control"}}` + "\n",
+		},
+		{
+			name:   "Codex archived sessions",
+			source: domain.SourceCodex,
+			path:   filepath.Join(home, ".codex", "archived_sessions", "session.jsonl"),
+			line:   `{"type":"event_msg","payload":{"type":"agent_message","message":"codex archive control"}}` + "\n",
+		},
+		{
+			name:   "Claude projects",
+			source: domain.SourceClaude,
+			path:   filepath.Join(home, ".claude", "projects", "project", "session.jsonl"),
+			line:   `{"type":"assistant","message":{"role":"assistant","content":"claude control"}}` + "\n",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if err := os.MkdirAll(filepath.Dir(test.path), 0o700); err != nil {
+				t.Fatalf("create provider transcript root: %v", err)
+			}
+			if err := os.WriteFile(test.path, []byte(test.line), 0o600); err != nil {
+				t.Fatalf("write provider transcript: %v", err)
+			}
+			session, err := (Normalizer{}).Normalize(context.Background(), domain.HookEvent{
+				Source: test.source, SessionID: "valid-control", TranscriptPath: test.path,
+			})
+			if err != nil {
+				t.Fatalf("normalize standard provider transcript: %v", err)
+			}
+			if len(session.Messages) != 1 {
+				t.Fatalf("messages = %#v, want one valid control message", session.Messages)
+			}
+		})
+	}
+}
+
+func TestNormalizeHonorsProviderHomeOverrides(t *testing.T) {
+	root := t.TempDir()
+	codexHome := filepath.Join(root, "codex-home")
+	claudeHome := filepath.Join(root, "claude-home")
+	t.Setenv("CODEX_HOME", codexHome)
+	t.Setenv("CLAUDE_CONFIG_DIR", claudeHome)
+
+	for source, path := range map[domain.Source]string{
+		domain.SourceCodex:  filepath.Join(codexHome, "sessions", "session.jsonl"),
+		domain.SourceClaude: filepath.Join(claudeHome, "projects", "session.jsonl"),
+	} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatalf("create override root: %v", err)
+		}
+		if err := os.WriteFile(path, []byte("{}\n"), 0o600); err != nil {
+			t.Fatalf("write override transcript: %v", err)
+		}
+		if _, err := (Normalizer{}).Normalize(context.Background(), domain.HookEvent{
+			Source: source, SessionID: "override", TranscriptPath: path,
+		}); err != nil {
+			t.Fatalf("normalize %s override transcript: %v", source, err)
+		}
+	}
+}
+
+func TestNormalizeRejectsPathsOutsideProviderAuthority(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "allowed")
+	outside := filepath.Join(t.TempDir(), "private.jsonl")
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatalf("create allowed root: %v", err)
+	}
+	if err := os.WriteFile(outside, []byte(`{"type":"event_msg","payload":{"type":"agent_message","message":"private"}}`+"\n"), 0o600); err != nil {
+		t.Fatalf("write outside transcript: %v", err)
+	}
+	normalizer := Normalizer{AllowedRoots: map[domain.Source][]string{domain.SourceCodex: {root}}}
+	_, err := normalizer.Normalize(context.Background(), domain.HookEvent{
+		Source: domain.SourceCodex, SessionID: "outside", TranscriptPath: outside,
+	})
+	if err == nil || !strings.Contains(err.Error(), "outside the allowed provider roots") {
+		t.Fatalf("outside-root error = %v", err)
+	}
+}
+
+func TestNormalizeRejectsTranscriptSymlinks(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "target.jsonl")
+	link := filepath.Join(root, "linked.jsonl")
+	if err := os.WriteFile(target, []byte("{}\n"), 0o600); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatalf("create transcript symlink: %v", err)
+	}
+	_, err := normalizerFor(link, domain.SourceCodex).Normalize(context.Background(), domain.HookEvent{
+		Source: domain.SourceCodex, SessionID: "symlink", TranscriptPath: link,
+	})
+	if err == nil || !strings.Contains(err.Error(), "must not be a symlink") {
+		t.Fatalf("symlink error = %v", err)
+	}
+}
+
+func TestNormalizeRejectsIntermediateSymlinkEscapes(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "allowed")
+	outside := filepath.Join(parent, "outside")
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatalf("create root: %v", err)
+	}
+	if err := os.MkdirAll(outside, 0o700); err != nil {
+		t.Fatalf("create outside: %v", err)
+	}
+	outsidePath := filepath.Join(outside, "private.jsonl")
+	if err := os.WriteFile(outsidePath, []byte("{}\n"), 0o600); err != nil {
+		t.Fatalf("write outside transcript: %v", err)
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "escape")); err != nil {
+		t.Fatalf("create intermediate symlink: %v", err)
+	}
+	path := filepath.Join(root, "escape", "private.jsonl")
+	normalizer := Normalizer{AllowedRoots: map[domain.Source][]string{domain.SourceCodex: {root}}}
+	_, err := normalizer.Normalize(context.Background(), domain.HookEvent{
+		Source: domain.SourceCodex, SessionID: "intermediate-symlink", TranscriptPath: path,
+	})
+	if err == nil || !strings.Contains(err.Error(), "outside the allowed provider roots") {
+		t.Fatalf("intermediate symlink error = %v", err)
+	}
+}
+
+func TestNormalizeRejectsSpecialFilesWithoutBlocking(t *testing.T) {
+	root := t.TempDir()
+	fifo := filepath.Join(root, "transcript.jsonl")
+	if err := unix.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatalf("create FIFO: %v", err)
+	}
+	result := make(chan error, 1)
+	go func() {
+		_, err := normalizerFor(fifo, domain.SourceCodex).Normalize(context.Background(), domain.HookEvent{
+			Source: domain.SourceCodex, SessionID: "fifo", TranscriptPath: fifo,
+		})
+		result <- err
+	}()
+	select {
+	case err := <-result:
+		if err == nil || !strings.Contains(err.Error(), "not a regular file") {
+			t.Fatalf("FIFO error = %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("FIFO transcript blocked normalization")
+	}
+}
+
+func TestNormalizeRejectsAggregateLimitOverflows(t *testing.T) {
+	message := `{"type":"event_msg","payload":{"type":"agent_message","message":"hello"}}` + "\n"
+	tests := []struct {
+		name     string
+		source   domain.Source
+		contents string
+		limits   Limits
+		want     string
+	}{
+		{
+			name:     "bytes",
+			source:   domain.SourceCodex,
+			contents: message,
+			limits:   Limits{MaximumBytes: int64(len(message) - 1), MaximumRecords: 10, MaximumMessages: 10},
+			want:     "maximum size",
+		},
+		{
+			name:     "records",
+			source:   domain.SourceCodex,
+			contents: message + message + message,
+			limits:   Limits{MaximumBytes: 1 << 20, MaximumRecords: 2, MaximumMessages: 10},
+			want:     "maximum record count",
+		},
+		{
+			name:     "messages",
+			source:   domain.SourceClaude,
+			contents: `{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"one"},{"type":"text","text":"two"},{"type":"text","text":"three"}]}}` + "\n",
+			limits:   Limits{MaximumBytes: 1 << 20, MaximumRecords: 10, MaximumMessages: 2},
+			want:     "maximum retained message count",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := writeTranscript(t, test.contents)
+			normalizer := normalizerFor(path, test.source)
+			normalizer.Limits = test.limits
+			_, err := normalizer.Normalize(context.Background(), domain.HookEvent{
+				Source: test.source, SessionID: "over-limit", TranscriptPath: path,
+			})
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("limit error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestNormalizeAcceptsAggregateValuesAtLimits(t *testing.T) {
+	contents := `{"type":"event_msg","payload":{"type":"agent_message","message":"at the boundary"}}` + "\n"
+	path := writeTranscript(t, contents)
+	normalizer := normalizerFor(path, domain.SourceCodex)
+	normalizer.Limits = Limits{
+		MaximumBytes: int64(len(contents)), MaximumRecords: 1, MaximumMessages: 1,
+	}
+	session, err := normalizer.Normalize(context.Background(), domain.HookEvent{
+		Source: domain.SourceCodex, SessionID: "at-limit", TranscriptPath: path,
+	})
+	if err != nil {
+		t.Fatalf("normalize transcript at exact limits: %v", err)
+	}
+	if len(session.Messages) != 1 || session.Messages[0].Text != "at the boundary" {
+		t.Fatalf("messages at exact limits = %#v", session.Messages)
+	}
+}
+
+func normalizerFor(path string, source domain.Source) Normalizer {
+	return Normalizer{AllowedRoots: map[domain.Source][]string{source: {filepath.Dir(path)}}}
 }
 
 func writeTranscript(t *testing.T, contents string) string {

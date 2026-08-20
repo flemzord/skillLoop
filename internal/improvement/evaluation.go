@@ -5,11 +5,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/flemzord/skillloop/internal/sanitize"
 )
 
 // Evaluate rehydrates the exact baseline and candidate commits. Structural
@@ -66,13 +69,13 @@ func (service Service) Evaluate(ctx context.Context, candidate Candidate) (Evalu
 	}
 	diffErr := validateDiff(diff)
 	addCheck("diff-limits", diffErr == nil && diff == candidate.Diff, detailFor(diffErr, diff == candidate.Diff, "diff matches candidate"))
-	addCheck("no-secrets", !containsSecret(diff), "candidate diff scanned")
+	addCheck("no-secrets", !sanitize.ContainsSecret(diff), "candidate diff scanned")
 
-	baselineBytes, err := gitBytes(ctx, repository, "show", candidate.BaseCommit+":"+candidate.InstructionPath)
+	baselineBytes, err := gitBytesLimit(ctx, repository, maxSkillFileBytes, "show", candidate.BaseCommit+":"+candidate.InstructionPath)
 	if err != nil {
 		return evaluation, err
 	}
-	candidateBytes, err := gitBytes(ctx, repository, "show", candidate.CandidateCommit+":"+candidate.InstructionPath)
+	candidateBytes, err := gitBytesLimit(ctx, repository, maxSkillFileBytes, "show", candidate.CandidateCommit+":"+candidate.InstructionPath)
 	if err != nil {
 		return evaluation, err
 	}
@@ -140,10 +143,16 @@ func (service Service) runExactPair(ctx context.Context, repository string, cand
 	}
 	defer cleanup()
 
-	if _, err := git(ctx, repository, "worktree", "add", "--detach", baselinePath, candidate.BaseCommit); err != nil {
+	if err := preflightWorktree(ctx, repository, candidate.BaseCommit); err != nil {
 		return RunResult{}, RunResult{}, err
 	}
-	if _, err := git(ctx, repository, "worktree", "add", "--detach", candidatePath, candidate.CandidateCommit); err != nil {
+	if err := preflightWorktree(ctx, repository, candidate.CandidateCommit); err != nil {
+		return RunResult{}, RunResult{}, err
+	}
+	if _, err := addWorktree(ctx, repository, "--detach", baselinePath, candidate.BaseCommit); err != nil {
+		return RunResult{}, RunResult{}, err
+	}
+	if _, err := addWorktree(ctx, repository, "--detach", candidatePath, candidate.CandidateCommit); err != nil {
 		return RunResult{}, RunResult{}, err
 	}
 	baselineRun, err := service.runOne(ctx, baselinePath, candidate.BaseCommit)
@@ -172,12 +181,47 @@ func (service Service) runOne(ctx context.Context, directory, revision string) (
 	output := &cappedBuffer{limit: limit}
 	command := exec.CommandContext(runCtx, service.Runner.Argv[0], service.Runner.Argv[1:]...)
 	command.Dir = directory
-	command.Stdout = output
-	command.Stderr = output
+	terminator := configureProcessGroup(command)
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		return RunResult{}, fmt.Errorf("create evaluator output pipe: %w", err)
+	}
+	command.Stdout = writer
+	command.Stderr = writer
+	readDone := make(chan error, 1)
+	go func() {
+		_, copyErr := io.Copy(output, reader)
+		readDone <- copyErr
+	}()
 	started := time.Now()
-	runErr := command.Run()
+	if err := command.Start(); err != nil {
+		_ = writer.Close()
+		_ = reader.Close()
+		<-readDone
+		return RunResult{}, fmt.Errorf("start external evaluator at %s: %w", revision, err)
+	}
+	_ = writer.Close()
+	runErr := command.Wait()
+	// Wait returns as soon as the group leader exits because stdout/stderr are
+	// explicit files. Kill the isolated group even after a normal parent exit
+	// so descendants cannot retain the pipes or perform work after this call.
+	terminationErr := terminator.terminate()
+	var readErr error
+	select {
+	case readErr = <-readDone:
+	case <-time.After(runnerWaitDelay):
+		_ = reader.Close()
+		readErr = <-readDone
+	}
+	_ = reader.Close()
 	duration := time.Since(started)
 	timedOut := errors.Is(runCtx.Err(), context.DeadlineExceeded)
+	if readErr != nil && !errors.Is(readErr, os.ErrClosed) {
+		return RunResult{}, fmt.Errorf("read external evaluator output at %s: %w", revision, readErr)
+	}
+	if terminationErr != nil && !errors.Is(terminationErr, os.ErrProcessDone) {
+		return RunResult{}, fmt.Errorf("terminate external evaluator group at %s: %w", revision, terminationErr)
+	}
 	if runErr != nil && exitCode(runErr) < 0 && !timedOut {
 		return RunResult{}, fmt.Errorf("run external evaluator at %s: %w", revision, runErr)
 	}

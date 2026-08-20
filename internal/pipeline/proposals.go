@@ -121,6 +121,10 @@ func (manager Manager) Create(ctx context.Context, clusterID, actor string) (dom
 	proposal.Branch = candidate.Branch
 	proposal.BaseCommit = candidate.BaseCommit
 	proposal.CandidateCommit = candidate.CandidateCommit
+	proposal.Fingerprint = candidate.Fingerprint
+	proposal.Lesson = candidate.Lesson
+	proposal.CardKind = candidate.CardKind
+	proposal.RequiresHumanApproval = candidate.RequiresHumanApproval
 	proposal.CreatedAt = candidate.CreatedAt
 	proposal.UpdatedAt = candidate.CreatedAt
 	if err := manager.Store.SaveProposal(ctx, proposal); err != nil {
@@ -317,11 +321,17 @@ func (manager Manager) ProcessEligible(ctx context.Context, clusters []domain.Cl
 	}
 	for _, proposal := range pending {
 		if proposal.BaseCommit == "" || proposal.CandidateCommit == "" {
-			if manager.now().Sub(proposal.CreatedAt) < emptyReservationStaleAfter {
+			if manager.now().Sub(proposal.UpdatedAt) < emptyReservationStaleAfter {
 				continue
 			}
-			if err := manager.Store.AbandonProposal(ctx, proposal.ID); err != nil {
-				result.Failures = append(result.Failures, ProcessFailure{ClusterID: proposal.ClusterID, Error: err.Error()})
+			abandoned, abandonErr := manager.Store.AbandonProposalIfUnchanged(ctx, proposal.ID, proposal.UpdatedAt)
+			if abandonErr != nil {
+				result.Failures = append(result.Failures, ProcessFailure{ClusterID: proposal.ClusterID, Error: abandonErr.Error()})
+				continue
+			}
+			if !abandoned {
+				// Another worker refreshed or filled the reservation after this
+				// list snapshot. Leave it for the next drain.
 				continue
 			}
 			cluster, clusterErr := manager.Store.Cluster(ctx, proposal.ClusterID)
@@ -397,6 +407,7 @@ func (manager Manager) ProcessEligible(ctx context.Context, clusters []domain.Cl
 
 func (manager Manager) autopilot(ctx context.Context, proposal domain.Proposal, evaluation improvement.Evaluation, result *ProcessResult) {
 	if manager.Config.Mode != domain.ModeAutopilot || !manager.Config.Evaluation.AllowAutopilot ||
+		proposal.CardKind != domain.CardValidation || proposal.RequiresHumanApproval ||
 		len(manager.Config.Evaluation.Command) == 0 || !evaluation.Passed || evaluation.RequiresHumanApproval ||
 		evaluation.BaselineRun == nil || evaluation.CandidateRun == nil {
 		return
@@ -415,13 +426,16 @@ func (manager Manager) approve(ctx context.Context, proposal domain.Proposal, ev
 	if !evaluation.Passed || proposal.CandidateScore-proposal.BaselineScore < manager.Config.Evaluation.MinimumImprovement {
 		return domain.Promotion{}, improvement.ErrEvaluationFailed
 	}
+	_, skill, _, candidate, err := manager.loadCandidate(ctx, proposal.ID)
+	if err != nil {
+		return domain.Promotion{}, err
+	}
+	if actor == "autopilot" && (candidate.CardKind != domain.CardValidation || candidate.RequiresHumanApproval) {
+		return domain.Promotion{}, fmt.Errorf("pipeline: candidate requires explicit human approval: %w", improvement.ErrUnsafeChange)
+	}
 	if err := manager.Store.ApproveProposal(ctx, proposal.ID, proposal.BaseCommit, proposal.CandidateCommit, actor, auditJSON(map[string]string{
 		"base_commit": proposal.BaseCommit, "candidate_commit": proposal.CandidateCommit,
 	})); err != nil {
-		return domain.Promotion{}, err
-	}
-	_, skill, _, candidate, err := manager.loadCandidate(ctx, proposal.ID)
-	if err != nil {
 		return domain.Promotion{}, err
 	}
 	promoted, err := manager.Improver.Promote(ctx, skill, candidate, evaluation, improvement.Approval{
@@ -439,7 +453,14 @@ func (manager Manager) approve(ctx context.Context, proposal domain.Proposal, ev
 	if err := manager.Store.RecordPromotionDecision(ctx, promotion, actor, auditJSON(map[string]string{
 		"previous_commit": promotion.PreviousCommit, "promoted_commit": promotion.PromotedCommit,
 	})); err != nil {
-		return domain.Promotion{}, err
+		_, rollbackErr := manager.Improver.Rollback(context.Background(), skill)
+		if rollbackErr != nil {
+			return domain.Promotion{}, errors.Join(
+				fmt.Errorf("pipeline: persist promotion decision: %w", err),
+				fmt.Errorf("pipeline: compensate filesystem promotion: %w", rollbackErr),
+			)
+		}
+		return domain.Promotion{}, fmt.Errorf("pipeline: persist promotion decision; filesystem promotion rolled back: %w", err)
 	}
 	if err := manager.Improver.Cleanup(ctx, candidate); err != nil {
 		return promotion, fmt.Errorf("pipeline: promoted but candidate cleanup failed: %w", err)
@@ -495,7 +516,7 @@ func (manager Manager) persistedEvaluation(ctx context.Context, proposal domain.
 		SkillID: proposal.SkillID, ClusterID: proposal.ClusterID,
 		BaseCommit: proposal.BaseCommit, CandidateCommit: proposal.CandidateCommit,
 		BaselineRun: baselineRun, CandidateRun: candidateRun,
-		RequiresHumanApproval: metadata.RequiresHumanApproval,
+		RequiresHumanApproval: proposal.RequiresHumanApproval || metadata.RequiresHumanApproval,
 		Passed:                true, EvaluatedAt: candidate.CreatedAt,
 	}, nil
 }

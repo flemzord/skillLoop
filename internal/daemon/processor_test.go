@@ -20,6 +20,11 @@ import (
 func TestDrainCreatesOneClusterFromThreeSessions(t *testing.T) {
 	ctx := context.Background()
 	dataDir := t.TempDir()
+	codexSessions := filepath.Join(dataDir, "codex-home", "sessions")
+	t.Setenv("CODEX_HOME", filepath.Dir(codexSessions))
+	if err := os.MkdirAll(codexSessions, 0o700); err != nil {
+		t.Fatalf("create Codex session directory: %v", err)
+	}
 	database, err := store.Open(ctx, filepath.Join(dataDir, "skillloop.db"))
 	if err != nil {
 		t.Fatalf("open store: %v", err)
@@ -51,8 +56,9 @@ func TestDrainCreatesOneClusterFromThreeSessions(t *testing.T) {
 	}
 
 	for index := 1; index <= 3; index++ {
-		path := filepath.Join(dataDir, fmt.Sprintf("transcript-%d.jsonl", index))
-		contents := fmt.Sprintf("{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":%q}]}}\n{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Non, il faut lancer les tests avec Nix.\"}]}}\n", "Loaded "+skill.RepositoryPath+"/SKILL.md")
+		path := filepath.Join(codexSessions, fmt.Sprintf("transcript-%d.jsonl", index))
+		readCommand := fmt.Sprintf(`{"cmd":%q}`, "cat "+filepath.Join(skill.RepositoryPath, skill.InstructionPath))
+		contents := fmt.Sprintf("{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"name\":\"exec_command\",\"call_id\":\"read-skill-%d\",\"arguments\":%q}}\n{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"read-skill-%d\",\"output\":\"skill loaded\"}}\n{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Non, il faut lancer les tests avec Nix.\"}]}}\n", index, readCommand, index)
 		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
 			t.Fatalf("write transcript: %v", err)
 		}
@@ -86,7 +92,7 @@ func TestDrainCreatesOneClusterFromThreeSessions(t *testing.T) {
 
 	duplicate := domain.HookEvent{
 		ID: "event-3", Source: domain.SourceCodex, SessionID: "session-3",
-		TranscriptPath: filepath.Join(dataDir, "transcript-3.jsonl"), WorkingDir: workingDir,
+		TranscriptPath: filepath.Join(codexSessions, "transcript-3.jsonl"), WorkingDir: workingDir,
 		HookEventName: "stop", CapturedAt: time.Now(),
 	}
 	if _, err := (capture.Spool{DataDir: dataDir}).Write(duplicate); err != nil {
