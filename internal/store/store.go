@@ -192,7 +192,7 @@ func validateStateDirectoryAnchor(fd int, path string) error {
 	if stat.Uid != 0 && stat.Uid != uint32(os.Geteuid()) {
 		return fmt.Errorf("database directory ancestor %q is owned by another uid", path)
 	}
-	mode := uint32(stat.Mode)
+	mode := stat.Mode
 	groupCanRename := mode&unix.S_IWGRP != 0 && mode&unix.S_IXGRP != 0
 	worldCanRename := mode&unix.S_IWOTH != 0 && mode&unix.S_IXOTH != 0
 	if (groupCanRename || worldCanRename) && mode&unix.S_ISVTX == 0 {
