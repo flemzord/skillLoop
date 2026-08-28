@@ -44,6 +44,81 @@ func TestNormalizeCodexTranscript(t *testing.T) {
 	}
 }
 
+func TestNormalizeCodexUnifiedExecCommand(t *testing.T) {
+	workingDir := t.TempDir()
+	wrapper := `const r = await tools.exec_command({"cmd":"go test ./...","workdir":"/workspace"}); text(r.output);`
+	contents := fmt.Sprintf(
+		"{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"name\":\"exec\",\"call_id\":\"call-1\",\"input\":%q}}\n"+
+			"{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call_output\",\"call_id\":\"call-1\",\"output\":\"Script completed\\nFinal output:\\nok\"}}\n",
+		wrapper,
+	)
+	path := writeNativeTranscript(t, domain.SourceCodex, "unified-exec", workingDir, contents)
+	session, err := normalizerFor(path, domain.SourceCodex).Normalize(context.Background(), domain.HookEvent{
+		Source: domain.SourceCodex, SessionID: "unified-exec", WorkingDir: workingDir, TranscriptPath: path,
+	})
+	if err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if len(session.Messages) != 2 {
+		t.Fatalf("messages = %#v, want one call and one result", session.Messages)
+	}
+	for _, message := range session.Messages {
+		if message.ToolName != "exec_command" {
+			t.Fatalf("tool name = %q, want exec_command in %#v", message.ToolName, session.Messages)
+		}
+	}
+	if session.Messages[0].Text != `{"cmd":"go test ./...","workdir":"/workspace"}` {
+		t.Fatalf("normalized command = %q", session.Messages[0].Text)
+	}
+}
+
+func TestNormalizeCodexUnifiedExecCommandShapes(t *testing.T) {
+	tests := []struct {
+		name        string
+		toolName    string
+		input       string
+		wantName    string
+		wantCommand string
+	}{
+		{
+			name: "bare JavaScript cmd key", toolName: "exec",
+			input:       `const r = await tools.exec_command({cmd:"go test ./...",workdir:"/workspace"}); text(r.output);`,
+			wantName:    "exec_command",
+			wantCommand: `{"cmd":"go test ./..."}`,
+		},
+		{
+			name: "legacy direct call", toolName: "exec_command", input: `{"cmd":"go test ./..."}`,
+			wantName: "exec_command", wantCommand: `{"cmd":"go test ./..."}`,
+		},
+		{
+			name: "multiple nested commands remain ambiguous", toolName: "exec",
+			input:    `const a = tools.exec_command({"cmd":"first"}); const b = tools.exec_command({"cmd":"second"});`,
+			wantName: "exec",
+		},
+		{
+			name: "mixed nested tools remain ambiguous", toolName: "exec",
+			input:    `const a = tools.exec_command({"cmd":"first"}); const b = tools.apply_patch("patch");`,
+			wantName: "exec",
+		},
+		{
+			name: "invalid payload remains exec", toolName: "exec",
+			input:    `const r = tools.exec_command({command:"go test ./..."});`,
+			wantName: "exec",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			name, command := normalizeCodexToolCall(test.toolName, test.input)
+			if name != test.wantName {
+				t.Fatalf("name = %q, want %q", name, test.wantName)
+			}
+			if test.wantCommand != "" && command != test.wantCommand {
+				t.Fatalf("command = %q, want %q", command, test.wantCommand)
+			}
+		})
+	}
+}
+
 func TestNormalizeClaudeTranscript(t *testing.T) {
 	workingDir := t.TempDir()
 	path := writeNativeTranscript(t, domain.SourceClaude, "session-2", workingDir, `{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Use skillLoop"}]}}

@@ -37,7 +37,8 @@ func TestDrainCreatesOneClusterFromThreeSessions(t *testing.T) {
 	if err := os.MkdirAll(repository, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(repository, "SKILL.md"), []byte("---\nname: go-service\ndescription: Go service workflow\n---\n\n# Go service\n"), 0o600); err != nil {
+	skillContents := []byte("---\nname: go-service\ndescription: Go service workflow\n---\n\n# Go service\n")
+	if err := os.WriteFile(filepath.Join(repository, "SKILL.md"), skillContents, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	daemonGit(t, repository, "init", "-b", "main")
@@ -52,6 +53,22 @@ func TestDrainCreatesOneClusterFromThreeSessions(t *testing.T) {
 	if _, err := database.RegisterSkill(ctx, skill); err != nil {
 		t.Fatalf("register skill: %v", err)
 	}
+	home := filepath.Join(dataDir, "home")
+	t.Setenv("HOME", home)
+	storeSkill := filepath.Join(dataDir, "nix-store", "go-service")
+	if err := os.MkdirAll(storeSkill, 0o700); err != nil {
+		t.Fatalf("create immutable skill copy: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(storeSkill, "SKILL.md"), skillContents, 0o600); err != nil {
+		t.Fatalf("write immutable skill copy: %v", err)
+	}
+	installedSkill := filepath.Join(home, ".agents", "skills", skill.Name)
+	if err := os.MkdirAll(filepath.Dir(installedSkill), 0o700); err != nil {
+		t.Fatalf("create skill installation root: %v", err)
+	}
+	if err := os.Symlink(storeSkill, installedSkill); err != nil {
+		t.Fatalf("link installed skill: %v", err)
+	}
 	workingDir := filepath.Join(dataDir, "project")
 	if err := os.MkdirAll(workingDir, 0o700); err != nil {
 		t.Fatalf("create working dir: %v", err)
@@ -60,8 +77,9 @@ func TestDrainCreatesOneClusterFromThreeSessions(t *testing.T) {
 	for index := 1; index <= 3; index++ {
 		path := filepath.Join(codexSessions, fmt.Sprintf("transcript-%d.jsonl", index))
 		sessionID := fmt.Sprintf("session-%d", index)
-		readCommand := fmt.Sprintf(`{"cmd":%q}`, "cat "+filepath.Join(skill.RepositoryPath, skill.InstructionPath))
-		contents := codexTranscriptContents(sessionID, workingDir, fmt.Sprintf("{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"name\":\"exec_command\",\"call_id\":\"read-skill-%d\",\"arguments\":%q}}\n{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"read-skill-%d\",\"output\":\"skill loaded\"}}\n{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Non, il faut lancer les tests avec Nix.\"}]}}\n", index, readCommand, index))
+		readCommand := "cat " + filepath.Join(installedSkill, skill.InstructionPath)
+		wrapper := fmt.Sprintf(`const r = await tools.exec_command({cmd:%q,workdir:%q}); text(r.output);`, readCommand, workingDir)
+		contents := codexTranscriptContents(sessionID, workingDir, fmt.Sprintf("{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"name\":\"exec\",\"call_id\":\"read-skill-%d\",\"input\":%q}}\n{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call_output\",\"call_id\":\"read-skill-%d\",\"output\":\"skill loaded\"}}\n{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Non, il faut lancer les tests avec Nix.\"}]}}\n", index, wrapper, index))
 		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
 			t.Fatalf("write transcript: %v", err)
 		}

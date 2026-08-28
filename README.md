@@ -358,7 +358,7 @@ CI evaluates the Nix flake, runs formatting/lint/tests/build/audit checks, tests
 ## v0.1.0 limitations
 
 - Learning extraction is deterministic and heuristic. It recognizes explicit English/French correction markers, failed tool results, recoveries, and a bounded set of successful validation commands; it does not call a model.
-- Skill attribution requires a successful, correlated provider tool result that loaded the registered skill or read its exact registered `SKILL.md`; text-only mentions are not attribution evidence.
+- Skill attribution requires a successful, correlated provider tool result that loaded the registered skill or read either its exact registered `SKILL.md` or a content-identical copy beneath a standard user skill directory; text-only mentions are not attribution evidence.
 - Recurrence uses exact sanitized fingerprints rather than semantic similarity.
 - Only a tracked file named `SKILL.md` is eligible for candidate generation. v0.1.0 does not patch scripts, fixtures, examples, or multiple files.
 - Candidates add or replace a small SkillLoop-managed guidance block; there is no free-form model-generated rewrite.

@@ -1,10 +1,13 @@
 package learning
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
+	"os"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -13,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/flemzord/skillloop/internal/activation"
 	"github.com/flemzord/skillloop/internal/domain"
 	"github.com/flemzord/skillloop/internal/sanitize"
 )
@@ -109,6 +113,12 @@ func learningFingerprint(kind domain.CardKind, fact, lesson string) string {
 func attributedSkill(session domain.Session, skills []domain.Skill) (domain.Skill, bool) {
 	toolCalls := correlateToolCalls(session.Messages)
 	matches := make(map[string]domain.Skill, len(skills))
+	instructionPaths := make(map[string][]string, len(skills))
+	for _, skill := range skills {
+		if skill.Enabled {
+			instructionPaths[skill.ID] = trustedInstructionPaths(session.Source, skill)
+		}
+	}
 	for index, result := range session.Messages {
 		if result.Role != "tool" || !result.ToolResult || result.Failed || !readResultProvesContent(session.Source, result.Text) {
 			continue
@@ -118,7 +128,7 @@ func attributedSkill(session domain.Session, skills []domain.Skill) (domain.Skil
 			continue
 		}
 		for _, skill := range skills {
-			if skill.Enabled && isInstructionRead(session.Source, call, skill, session.WorkingDir) {
+			if skill.Enabled && isInstructionRead(session.Source, call, skill, session.WorkingDir, instructionPaths[skill.ID]) {
 				matches[skill.ID] = skill
 			}
 		}
@@ -132,31 +142,102 @@ func attributedSkill(session domain.Session, skills []domain.Skill) (domain.Skil
 	return domain.Skill{}, false
 }
 
-func isInstructionRead(source domain.Source, call domain.Message, skill domain.Skill, workingDir string) bool {
+func isInstructionRead(source domain.Source, call domain.Message, skill domain.Skill, workingDir string, expectedPaths []string) bool {
 	toolName := strings.TrimSpace(call.ToolName)
 	if source == domain.SourceClaude && toolName == "Skill" {
 		loadedSkill := strings.TrimSpace(stringArgument(call.Text, "skill", "name"))
 		return loadedSkill != "" && strings.EqualFold(loadedSkill, strings.TrimSpace(skill.Name))
 	}
 
+	if source == domain.SourceClaude && toolName == "Read" {
+		for _, path := range stringArguments(call.Text, "file_path", "path", "filename") {
+			if matchesInstructionPath(path, expectedPaths, workingDir) {
+				return true
+			}
+		}
+		return matchesInstructionPath(strings.TrimSpace(call.Text), expectedPaths, workingDir)
+	}
+	if !isProviderShellTool(source, toolName) {
+		return false
+	}
+	for _, expected := range expectedPaths {
+		if shellReadsInstruction(commandText(call.Text), expected, workingDir) {
+			return true
+		}
+	}
+	return false
+}
+
+func trustedInstructionPaths(source domain.Source, skill domain.Skill) []string {
 	expected := skill.InstructionPath
 	if !filepath.IsAbs(expected) {
 		expected = filepath.Join(skill.RepositoryPath, expected)
 	}
 	expected = filepath.Clean(expected)
-
-	if source == domain.SourceClaude && toolName == "Read" {
-		for _, path := range stringArguments(call.Text, "file_path", "path", "filename") {
-			if sameInstructionPath(path, expected, workingDir) {
-				return true
-			}
-		}
-		return sameInstructionPath(strings.TrimSpace(call.Text), expected, workingDir)
+	paths := []string{expected}
+	name, err := activation.SafeName(skill.Name)
+	if err != nil {
+		return paths
 	}
-	if !isProviderShellTool(source, toolName) {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return paths
+	}
+	roots := []string{filepath.Join(home, ".agents", "skills")}
+	switch source {
+	case domain.SourceCodex:
+		root := os.Getenv("CODEX_HOME")
+		if root == "" {
+			root = filepath.Join(home, ".codex")
+		}
+		roots = append(roots, filepath.Join(root, "skills"))
+	case domain.SourceClaude:
+		root := os.Getenv("CLAUDE_CONFIG_DIR")
+		if root == "" {
+			root = filepath.Join(home, ".claude")
+		}
+		roots = append(roots, filepath.Join(root, "skills"))
+	}
+	for _, root := range roots {
+		candidate := filepath.Join(root, name, "SKILL.md")
+		if sameInstructionContents(expected, candidate) {
+			paths = append(paths, candidate)
+		}
+	}
+	return paths
+}
+
+func matchesInstructionPath(value string, expectedPaths []string, workingDir string) bool {
+	for _, expected := range expectedPaths {
+		if sameInstructionPath(value, expected, workingDir) {
+			return true
+		}
+	}
+	return false
+}
+
+func sameInstructionContents(source, installed string) bool {
+	const maximumInstructionSize = 8 << 20
+	sourceContents, ok := readInstructionContents(source, maximumInstructionSize)
+	if !ok {
 		return false
 	}
-	return shellReadsInstruction(commandText(call.Text), expected, workingDir)
+	installedContents, ok := readInstructionContents(installed, maximumInstructionSize)
+	return ok && bytes.Equal(sourceContents, installedContents)
+}
+
+func readInstructionContents(path string, maximumSize int64) ([]byte, bool) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, false
+	}
+	defer func() { _ = file.Close() }()
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Size() < 0 || info.Size() > maximumSize {
+		return nil, false
+	}
+	contents, err := io.ReadAll(io.LimitReader(file, maximumSize+1))
+	return contents, err == nil && int64(len(contents)) <= maximumSize
 }
 
 func stringArgument(value string, keys ...string) string {

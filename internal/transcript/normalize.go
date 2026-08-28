@@ -439,10 +439,12 @@ func parseCodex(record map[string]any, toolNames map[string]string) []domain.Mes
 	case typeName == "response_item" && (payloadType == "function_call" || payloadType == "custom_tool_call"):
 		name := stringValue(payload["name"])
 		callID := firstString(payload, "call_id", "id")
+		input := firstString(payload, "arguments", "input")
+		name, input = normalizeCodexToolCall(name, input)
 		if callID != "" {
 			toolNames[callID] = name
 		}
-		return []domain.Message{{Role: "tool", ToolName: name, ToolCallID: callID, Text: firstString(payload, "arguments", "input")}}
+		return []domain.Message{{Role: "tool", ToolName: name, ToolCallID: callID, Text: input}}
 	case typeName == "response_item" && (payloadType == "function_call_output" || payloadType == "custom_tool_call_output"):
 		output := firstString(payload, "output", "content")
 		callID := firstString(payload, "call_id", "id")
@@ -451,6 +453,138 @@ func parseCodex(record map[string]any, toolNames map[string]string) []domain.Mes
 	default:
 		return nil
 	}
+}
+
+// normalizeCodexToolCall unwraps the single-call JavaScript envelope emitted by
+// Codex's unified exec tool. Ambiguous wrappers remain named exec so downstream
+// trust checks continue to reject them.
+func normalizeCodexToolCall(name, input string) (string, string) {
+	if name != "exec" || strings.Count(input, "tools.") != 1 || strings.Count(input, "tools.exec_command") != 1 {
+		return name, input
+	}
+	const invocation = "tools.exec_command"
+	index := strings.Index(input, invocation)
+	index += len(invocation)
+	index = skipWhitespace(input, index)
+	if index >= len(input) || input[index] != '(' {
+		return name, input
+	}
+	index = skipWhitespace(input, index+1)
+	object, end, ok := jsonObjectAt(input, index)
+	if !ok {
+		return name, input
+	}
+	end = skipWhitespace(input, end)
+	if end >= len(input) || input[end] != ')' {
+		return name, input
+	}
+	payload, ok := codexExecCommandPayload(object)
+	if !ok {
+		return name, input
+	}
+	return "exec_command", payload
+}
+
+func codexExecCommandPayload(object string) (string, bool) {
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(object), &payload); err == nil {
+		var command string
+		if err := json.Unmarshal(payload["cmd"], &command); err == nil && strings.TrimSpace(command) != "" {
+			return object, true
+		}
+		return "", false
+	}
+
+	// Older unified-exec envelopes used a JavaScript object literal with an
+	// unquoted first `cmd` key. Accept only that narrow shape and retain only the
+	// decoded command instead of attempting to evaluate arbitrary JavaScript.
+	inner := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(object, "{"), "}"))
+	if !strings.HasPrefix(inner, "cmd") {
+		return "", false
+	}
+	index := skipWhitespace(inner, len("cmd"))
+	if index >= len(inner) || inner[index] != ':' {
+		return "", false
+	}
+	index = skipWhitespace(inner, index+1)
+	quoted, _, ok := jsonStringAt(inner, index)
+	if !ok {
+		return "", false
+	}
+	var command string
+	if err := json.Unmarshal([]byte(quoted), &command); err != nil || strings.TrimSpace(command) == "" {
+		return "", false
+	}
+	normalized, err := json.Marshal(map[string]string{"cmd": command})
+	return string(normalized), err == nil
+}
+
+func skipWhitespace(value string, index int) int {
+	for index < len(value) {
+		switch value[index] {
+		case ' ', '\t', '\n', '\r':
+			index++
+		default:
+			return index
+		}
+	}
+	return index
+}
+
+func jsonObjectAt(value string, start int) (string, int, bool) {
+	if start >= len(value) || value[start] != '{' {
+		return "", start, false
+	}
+	depth := 0
+	inString := false
+	escaped := false
+	for index := start; index < len(value); index++ {
+		character := value[index]
+		if inString {
+			switch {
+			case escaped:
+				escaped = false
+			case character == '\\':
+				escaped = true
+			case character == '"':
+				inString = false
+			}
+			continue
+		}
+		switch character {
+		case '"':
+			inString = true
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return value[start : index+1], index + 1, true
+			}
+			if depth < 0 {
+				return "", start, false
+			}
+		}
+	}
+	return "", start, false
+}
+
+func jsonStringAt(value string, start int) (string, int, bool) {
+	if start >= len(value) || value[start] != '"' {
+		return "", start, false
+	}
+	escaped := false
+	for index := start + 1; index < len(value); index++ {
+		switch {
+		case escaped:
+			escaped = false
+		case value[index] == '\\':
+			escaped = true
+		case value[index] == '"':
+			return value[start : index+1], index + 1, true
+		}
+	}
+	return "", start, false
 }
 
 func parseClaude(record map[string]any, toolNames map[string]string) []domain.Message {

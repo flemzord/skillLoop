@@ -892,6 +892,55 @@ func TestAnalyzeAcceptsProviderNormalizedInstructionReads(t *testing.T) {
 	}
 }
 
+func TestAnalyzeAttributesMatchingInstalledSkillCopy(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	repository := t.TempDir()
+	source := filepath.Join(repository, "SKILL.md")
+	contents := []byte("---\nname: go-service\ndescription: Go workflow\n---\n")
+	if err := os.WriteFile(source, contents, 0o600); err != nil {
+		t.Fatalf("write source skill: %v", err)
+	}
+	storeSkill := filepath.Join(t.TempDir(), "go-service")
+	if err := os.MkdirAll(storeSkill, 0o700); err != nil {
+		t.Fatalf("create installed skill: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(storeSkill, "SKILL.md"), contents, 0o600); err != nil {
+		t.Fatalf("write installed skill: %v", err)
+	}
+	installed := filepath.Join(home, ".agents", "skills", "go-service")
+	if err := os.MkdirAll(filepath.Dir(installed), 0o700); err != nil {
+		t.Fatalf("create installation root: %v", err)
+	}
+	if err := os.Symlink(storeSkill, installed); err != nil {
+		t.Fatalf("link Nix-style installed skill: %v", err)
+	}
+
+	instruction := filepath.Join(installed, "SKILL.md")
+	messages := append(codexInstructionRead(instruction), domain.Message{Role: "user", Text: "Non, il faut lancer les tests."})
+	skill := domain.Skill{
+		ID: "skill-1", Name: "Go Service", RepositoryPath: repository,
+		InstructionPath: "SKILL.md", Enabled: true,
+	}
+	cards := NewAnalyzer().Analyze(
+		domain.Session{Source: domain.SourceCodex, ExternalID: "installed-copy", Messages: messages},
+		[]domain.Skill{skill},
+	)
+	if len(cards) != 1 || cards[0].SkillID != skill.ID {
+		t.Fatalf("cards = %#v, want installed copy attributed to source skill", cards)
+	}
+
+	if err := os.WriteFile(filepath.Join(storeSkill, "SKILL.md"), []byte("different instructions"), 0o600); err != nil {
+		t.Fatalf("replace installed skill: %v", err)
+	}
+	if cards := NewAnalyzer().Analyze(
+		domain.Session{Source: domain.SourceCodex, ExternalID: "diverged-copy", Messages: messages},
+		[]domain.Skill{skill},
+	); len(cards) != 0 {
+		t.Fatalf("diverged installed copy was attributed: %#v", cards)
+	}
+}
+
 func TestFailureFingerprintBindsNormalizedRecovery(t *testing.T) {
 	makeCard := func(sessionID, recovery string) domain.LearningCard {
 		session := domain.Session{
