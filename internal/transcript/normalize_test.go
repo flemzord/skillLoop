@@ -72,6 +72,33 @@ func TestNormalizeCodexUnifiedExecCommand(t *testing.T) {
 	}
 }
 
+func TestNormalizeCodexUnifiedExecBlockOutput(t *testing.T) {
+	workingDir := t.TempDir()
+	wrapper := `const r = await tools.exec_command({"cmd":"cat /workspace/SKILL.md"}); text(r.output);`
+	contents := fmt.Sprintf(
+		"{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"name\":\"exec\",\"call_id\":\"call-1\",\"input\":%q}}\n"+
+			"{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call_output\",\"call_id\":\"call-1\",\"output\":[{\"type\":\"input_text\",\"text\":\"Script completed\\nOutput:\\n\"},{\"type\":\"input_text\",\"text\":\"# Skill contents\"}]}}\n",
+		wrapper,
+	)
+	path := writeNativeTranscript(t, domain.SourceCodex, "unified-exec-block-output", workingDir, contents)
+	session, err := normalizerFor(path, domain.SourceCodex).Normalize(context.Background(), domain.HookEvent{
+		Source: domain.SourceCodex, SessionID: "unified-exec-block-output", WorkingDir: workingDir, TranscriptPath: path,
+	})
+	if err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if len(session.Messages) != 2 {
+		t.Fatalf("messages = %#v, want one call and one result", session.Messages)
+	}
+	result := session.Messages[1]
+	if result.ToolName != "exec_command" || !result.ToolResult || result.Failed {
+		t.Fatalf("result = %#v", result)
+	}
+	if result.Text != "Script completed\nOutput:\n\n# Skill contents" {
+		t.Fatalf("block output = %q", result.Text)
+	}
+}
+
 func TestNormalizeCodexUnifiedExecCommandShapes(t *testing.T) {
 	tests := []struct {
 		name        string

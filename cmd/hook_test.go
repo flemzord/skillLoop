@@ -9,14 +9,22 @@ import (
 	"testing"
 
 	"github.com/flemzord/skillloop/internal/capture"
+	"github.com/flemzord/skillloop/internal/config"
 	"github.com/flemzord/skillloop/internal/domain"
 )
 
 func TestHookCommandCapturesEventWithoutOutput(t *testing.T) {
 	dataRoot := t.TempDir()
 	configRoot := t.TempDir()
-	t.Setenv("XDG_DATA_HOME", dataRoot)
-	t.Setenv("XDG_CONFIG_HOME", configRoot)
+	configPath := filepath.Join(configRoot, "config.yaml")
+	settings, err := config.Default()
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings.DataDir = filepath.Join(dataRoot, "skillloop")
+	if _, err := config.WriteInitial(configPath, settings); err != nil {
+		t.Fatal(err)
+	}
 	payload := `{
         "session_id":"session-1",
         "prompt_id":"prompt-1",
@@ -28,13 +36,13 @@ func TestHookCommandCapturesEventWithoutOutput(t *testing.T) {
         "last_assistant_message":"must not persist",
         "background_tasks":[{"command":"secret command"}]
     }`
-	command := NewRootCommand()
+	command := newHookCommand(&rootOptions{configPath: configPath})
 	stdout := bytes.NewBuffer(nil)
 	stderr := bytes.NewBuffer(nil)
 	command.SetOut(stdout)
 	command.SetErr(stderr)
 	command.SetIn(strings.NewReader(payload))
-	command.SetArgs([]string{"hook", "--provider", "claude", "--event", "stop"})
+	command.SetArgs([]string{"--provider", "claude", "--event", "stop"})
 	if err := command.Execute(); err != nil {
 		t.Fatalf("execute hook: %v", err)
 	}

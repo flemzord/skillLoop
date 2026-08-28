@@ -69,6 +69,58 @@ func TestOpenConfiguresSQLiteAndConstraints(t *testing.T) {
 	}
 }
 
+func TestListSessionsReturnsDurableMetadataWithoutMessages(t *testing.T) {
+	database := openTestStore(t)
+	ctx := context.Background()
+	session := testSession("listed")
+	session.TurnID = "turn-1"
+	session.Outcome = domain.SessionOutcomeSucceeded
+	session.Messages = []domain.Message{{Role: "user", Text: "must not persist"}}
+	mustRecordSession(t, database, session)
+
+	sessions, err := database.ListSessions(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sessions) != 1 {
+		t.Fatalf("sessions = %#v", sessions)
+	}
+	got := sessions[0]
+	if got.Reference != session.Reference || got.ExternalID != session.ExternalID || got.TurnID != session.TurnID ||
+		got.WorkingDir != session.WorkingDir || got.TranscriptPath != session.TranscriptPath || got.Outcome != session.Outcome {
+		t.Fatalf("session metadata = %#v, want %#v", got, session)
+	}
+	if len(got.Messages) != 0 {
+		t.Fatalf("persisted transcript messages: %#v", got.Messages)
+	}
+}
+
+func TestAddLearningCardsIsAtomicAndIdempotent(t *testing.T) {
+	database := openTestStore(t)
+	ctx := context.Background()
+	skill := testSkill("batch")
+	session := testSession("batch")
+	mustRegisterSkill(t, database, skill)
+	mustRecordSession(t, database, session)
+	valid := testCard("card-valid", session.Reference, skill.ID, "fingerprint-valid")
+	invalid := testCard("card-invalid", "missing-session", skill.ID, "fingerprint-invalid")
+
+	if _, err := database.AddLearningCards(ctx, []domain.LearningCard{valid, invalid}); err == nil {
+		t.Fatal("batch with invalid foreign key unexpectedly succeeded")
+	}
+	if cards, err := database.ListLearningCards(ctx, ""); err != nil || len(cards) != 0 {
+		t.Fatalf("failed batch was not rolled back: cards=%#v err=%v", cards, err)
+	}
+	created, err := database.AddLearningCards(ctx, []domain.LearningCard{valid, valid})
+	if err != nil || created != 1 {
+		t.Fatalf("idempotent batch: created=%d err=%v", created, err)
+	}
+	created, err = database.AddLearningCards(ctx, []domain.LearningCard{valid})
+	if err != nil || created != 0 {
+		t.Fatalf("repeated batch: created=%d err=%v", created, err)
+	}
+}
+
 func TestOpenRejectsUnsafeDatabaseEntries(t *testing.T) {
 	tests := []struct {
 		name  string

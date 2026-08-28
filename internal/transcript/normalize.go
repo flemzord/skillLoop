@@ -446,7 +446,10 @@ func parseCodex(record map[string]any, toolNames map[string]string) []domain.Mes
 		}
 		return []domain.Message{{Role: "tool", ToolName: name, ToolCallID: callID, Text: input}}
 	case typeName == "response_item" && (payloadType == "function_call_output" || payloadType == "custom_tool_call_output"):
-		output := firstString(payload, "output", "content")
+		output := contentText(payload["output"])
+		if output == "" {
+			output = contentText(payload["content"])
+		}
 		callID := firstString(payload, "call_id", "id")
 		name := toolNames[callID]
 		return []domain.Message{{Role: "tool", ToolName: name, ToolCallID: callID, ToolResult: true, Text: output, Failed: looksFailed(output)}}

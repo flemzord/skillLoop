@@ -393,6 +393,34 @@ func (s *Store) RecordSession(ctx context.Context, session domain.Session) (bool
 	return s.recordSession(ctx, s.db, session)
 }
 
+// ListSessions returns the durable session metadata needed to re-read provider
+// transcripts. Transcript messages are deliberately never persisted.
+func (s *Store) ListSessions(ctx context.Context) ([]domain.Session, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT reference, source, external_id, turn_id, working_dir, transcript_path, outcome
+		FROM sessions ORDER BY source, external_id, reference`)
+	if err != nil {
+		return nil, fmt.Errorf("store: list sessions: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var sessions []domain.Session
+	for rows.Next() {
+		var session domain.Session
+		if err := rows.Scan(
+			&session.Reference, &session.Source, &session.ExternalID, &session.TurnID,
+			&session.WorkingDir, &session.TranscriptPath, &session.Outcome,
+		); err != nil {
+			return nil, fmt.Errorf("store: scan session: %w", err)
+		}
+		sessions = append(sessions, session)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate sessions: %w", err)
+	}
+	return sessions, nil
+}
+
 type sqlExecutor interface {
 	ExecContext(context.Context, string, ...any) (sql.Result, error)
 	QueryRowContext(context.Context, string, ...any) *sql.Row
@@ -573,6 +601,31 @@ func (s *Store) PruneRetention(
 
 func (s *Store) AddLearningCard(ctx context.Context, card domain.LearningCard) (bool, error) {
 	return s.addLearningCard(ctx, s.db, card)
+}
+
+// AddLearningCards inserts a replay batch atomically. Existing cards are
+// ignored by their durable session/skill/fingerprint identity.
+func (s *Store) AddLearningCards(ctx context.Context, cards []domain.LearningCard) (int, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("store: begin learning card batch: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	created := 0
+	for _, card := range cards {
+		inserted, err := s.addLearningCard(ctx, tx, card)
+		if err != nil {
+			return 0, err
+		}
+		if inserted {
+			created++
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("store: commit learning card batch: %w", err)
+	}
+	return created, nil
 }
 
 func (s *Store) addLearningCard(ctx context.Context, executor sqlExecutor, card domain.LearningCard) (bool, error) {

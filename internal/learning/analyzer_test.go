@@ -39,6 +39,19 @@ func TestAnalyzeAttributedCorrectionAndFailure(t *testing.T) {
 	}
 }
 
+func TestAnalyzeIgnoresInjectedAgentInstructionsAsCorrections(t *testing.T) {
+	session := domain.Session{
+		Source: domain.SourceCodex, ExternalID: "injected-context",
+		Messages: append(codexInstructionRead("/skills/go-service/SKILL.md"),
+			domain.Message{Role: "user", Text: "# AGENTS.md instructions\n\n<INSTRUCTIONS>\n- Tu dois lancer les tests.\n</INSTRUCTIONS>\n<environment_context>...</environment_context>"},
+		),
+	}
+	skill := domain.Skill{ID: "skill-1", Name: "go-service", RepositoryPath: "/skills/go-service", InstructionPath: "SKILL.md", Enabled: true}
+	if cards := NewAnalyzer().Analyze(session, []domain.Skill{skill}); len(cards) != 0 {
+		t.Fatalf("injected instructions produced learning cards: %#v", cards)
+	}
+}
+
 func TestAnalyzeRedactsExpandedSecretFamilies(t *testing.T) {
 	skill := domain.Skill{
 		ID: "skill-1", Name: "go-service", RepositoryPath: "/skills/go-service",

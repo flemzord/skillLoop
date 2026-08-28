@@ -172,6 +172,15 @@ The following workflow uses the default XDG configuration and `propose` mode.
    skillloop cluster list --eligible
    ```
 
+   To backfill sessions captured before a learning-rule fix, preview the replay first, then apply it:
+
+   ```sh
+   skillloop learning reanalyze --all --dry-run
+   skillloop learning reanalyze --all
+   ```
+
+   Reanalysis uses the stored provider session identity. If Codex has moved a JSONL out of `sessions`, SkillLoop searches `archived_sessions` and accepts it only when the transcript's native session ID and working directory still match the stored metadata. Existing cards are skipped idempotently.
+
 6. Create, review, evaluate, and promote a candidate using the proposal commands described below.
 
 ## The `propose` workflow
@@ -314,6 +323,7 @@ Run `skillloop <command> --help` for flags and shell completion.
 | `skillloop skill uninstall <skill-id> [--codex-only\|--claude-only]` | Remove only matching SkillLoop-managed skill links. |
 | `skillloop daemon [--once] [--limit 100]` | Drain captured events asynchronously. |
 | `skillloop learning list [--skill id] [--json]` | Inspect sanitized learning cards. |
+| `skillloop learning reanalyze --all [--dry-run] [--json]` | Reanalyze stored sessions and resolve provider-archived transcripts. |
 | `skillloop cluster list [--eligible] [--json]` | Inspect recurring frictions. |
 | `skillloop mode get` | Print the configured autonomy mode. |
 | `skillloop mode set <observe\|propose\|autopilot>` | Change mode after validating its safety requirements. |

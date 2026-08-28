@@ -2,14 +2,77 @@ package cmd
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/spf13/cobra"
+
+	"github.com/flemzord/skillloop/internal/learning"
+	"github.com/flemzord/skillloop/internal/reanalysis"
+	"github.com/flemzord/skillloop/internal/transcript"
 )
 
 func newLearningCommand(options *rootOptions) *cobra.Command {
 	command := &cobra.Command{Use: "learning", Short: "Inspect learning cards"}
-	command.AddCommand(newLearningListCommand(options))
+	command.AddCommand(newLearningListCommand(options), newLearningReanalyzeCommand(options))
+	return command
+}
+
+func newLearningReanalyzeCommand(options *rootOptions) *cobra.Command {
+	all := false
+	dryRun := false
+	jsonOutput := false
+	command := &cobra.Command{
+		Use:   "reanalyze",
+		Short: "Reanalyze stored sessions, including archived transcripts",
+		Args:  cobra.NoArgs,
+		RunE: func(command *cobra.Command, _ []string) error {
+			if !all {
+				return errors.New("learning reanalyze requires --all")
+			}
+			state, err := openRuntime(command.Context(), options.configPath)
+			if err != nil {
+				return err
+			}
+			defer state.close()
+
+			service := reanalysis.Service{
+				Store:      state.store,
+				Normalizer: transcript.Normalizer{},
+				Analyzer:   learning.NewAnalyzer(),
+			}
+			result, err := service.Run(command.Context(), reanalysis.Options{
+				DryRun:          dryRun,
+				MinimumSessions: state.config.Aggregation.MinimumSessions,
+			})
+			if err != nil {
+				return err
+			}
+			reanalysis.SortIssues(result.Issues)
+			if jsonOutput {
+				encoder := json.NewEncoder(command.OutOrStdout())
+				encoder.SetIndent("", "  ")
+				return encoder.Encode(result)
+			}
+			if _, err := fmt.Fprintf(command.OutOrStdout(),
+				"dry_run=%t sessions=%d resolved=%d missing=%d failed=%d sessions_with_cards=%d cards_found=%d cards_new=%d cards_created=%d clusters=%d eligible_clusters=%d\n",
+				result.DryRun, result.Sessions, result.Resolved, result.Missing, result.Failed,
+				result.SessionsWithCards, result.CardsFound, result.CardsNew, result.CardsCreated,
+				result.Clusters, result.EligibleClusters,
+			); err != nil {
+				return err
+			}
+			for _, issue := range result.Issues {
+				if _, err := fmt.Fprintf(command.ErrOrStderr(), "skip %s: %s\n", terminalSafe(issue.SessionRef), terminalSafe(issue.Reason)); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+	}
+	command.Flags().BoolVar(&all, "all", false, "reanalyze every stored session")
+	command.Flags().BoolVar(&dryRun, "dry-run", false, "analyze without writing cards or rebuilding clusters")
+	command.Flags().BoolVar(&jsonOutput, "json", false, "emit JSON")
 	return command
 }
 

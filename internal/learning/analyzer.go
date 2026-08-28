@@ -44,7 +44,7 @@ func (analyzer Analyzer) Analyze(session domain.Session, skills []domain.Skill) 
 	toolCalls := correlateToolCalls(session.Messages)
 	for index, message := range session.Messages {
 		switch {
-		case message.Role == "user" && correctionPattern.MatchString(message.Text):
+		case message.Role == "user" && !injectedContext(message.Text) && correctionPattern.MatchString(message.Text):
 			lesson := sanitize.Text(message.Text)
 			cards = append(cards, analyzer.card(
 				sessionRef, skill.ID, domain.CardCorrection, lesson, "Explicit user correction", lesson, 0.9,
@@ -75,6 +75,21 @@ func (analyzer Analyzer) Analyze(session domain.Session, skills []domain.Skill) 
 		}
 	}
 	return deduplicate(cards)
+}
+
+func injectedContext(value string) bool {
+	trimmed := strings.TrimSpace(value)
+	if strings.HasPrefix(trimmed, "# AGENTS.md instructions") && strings.Contains(trimmed, "<INSTRUCTIONS>") {
+		return true
+	}
+	for _, marker := range []string{
+		"<skills_instructions>", "<environment_context>", "<permissions instructions>",
+	} {
+		if strings.HasPrefix(trimmed, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func (analyzer Analyzer) card(
